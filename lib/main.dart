@@ -488,11 +488,12 @@ class _AudioPageState extends State<AudioPage> {
   }
 
   Future<void> _loadDevices() async {
-    if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux) return;
-    try {
-      final devices = await _recorder.listInputDevices();
-      if (mounted) setState(() { _devices = devices; _selectedDevice = devices.isEmpty ? null : devices.first; });
-    } catch (_) {}
+    if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+      try {
+        final devices = await _recorder.listInputDevices();
+        if (mounted) setState(() { _devices = devices; _selectedDevice = null; });
+      } catch (_) {}
+    }
   }
 
   Future<void> _record() async {
@@ -525,8 +526,15 @@ class _AudioPageState extends State<AudioPage> {
       final directory = await getTemporaryDirectory();
       final path = p.join(directory.path, '${widget.item.id}.wav');
       _amplitudes.clear();
-      final device = Platform.isWindows || Platform.isMacOS || Platform.isLinux ? _selectedDevice : null;
-      await _recorder.start(RecordConfig(encoder: AudioEncoder.wav, sampleRate: 44100, numChannels: 1, device: device), path: path);
+      final device = Platform.isWindows ? _selectedDevice : null;
+      final sampleRate = Platform.isWindows ? 48000 : 44100;
+      final channels = Platform.isWindows ? 2 : 1;
+      try {
+        await _recorder.start(RecordConfig(encoder: AudioEncoder.wav, sampleRate: sampleRate, numChannels: channels, device: device), path: path);
+      } catch (_) {
+        if (!Platform.isWindows || device == null) rethrow;
+        await _recorder.start(RecordConfig(encoder: AudioEncoder.wav, sampleRate: sampleRate, numChannels: channels), path: path);
+      }
       final startedAt = DateTime.now();
       if (mounted) setState(() { _recording = true; _progress = 0; });
       _progressTimer = Timer.periodic(const Duration(milliseconds: 30), (_) {
@@ -546,11 +554,6 @@ class _AudioPageState extends State<AudioPage> {
         await widget.database.save(await _sessionContainingItem());
         widget.onChanged();
         await _padWav(recordingPath);
-        if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
-          await _normalizeRecording(recordingPath);
-          await _padWav(recordingPath);
-          await widget.database.save(await _sessionContainingItem());
-        }
         await _extractRecordedWaveform(recordingPath);
         widget.onChanged();
       }
@@ -577,48 +580,15 @@ class _AudioPageState extends State<AudioPage> {
     }
   }
 
-  Future<double?> _measureMeanVolume(String path) async {
-    final session = await FFmpegKit.execute('-hide_banner -i "${_ffmpegPath(path)}" -af volumedetect -f null -');
-    final output = await session.getOutput() ?? '';
-    final match = RegExp(r'mean_volume:\s*(-?(?:\d+(?:\.\d+)?|\.\d+))\s*dB').firstMatch(output);
-    return match == null ? null : double.tryParse(match.group(1)!);
-  }
-
-  Future<void> _normalizeRecording(String path) async {
-    String? normalizedPath;
-    try {
-      final originalVolume = await _measureMeanVolume(widget.item.sourcePath);
-      final recordedVolume = await _measureMeanVolume(path);
-      if (originalVolume == null || recordedVolume == null) return;
-
-      final gain = (originalVolume - recordedVolume).clamp(-18.0, 18.0);
-      if (gain.abs() < 0.05) return;
-
-      final directory = await getTemporaryDirectory();
-      normalizedPath = p.join(directory.path, '${widget.item.id}.normalized.wav');
-      final session = await FFmpegKit.execute('-y -hide_banner -i "${_ffmpegPath(path)}" -af "volume=${gain.toStringAsFixed(2)}dB,alimiter=limit=0.98" -ar 44100 -ac 1 -c:a pcm_s16le "${_ffmpegPath(normalizedPath)}"');
-      final code = await session.getReturnCode();
-      if (code == null || !ReturnCode.isSuccess(code) || !await File(normalizedPath).exists()) return;
-
-      await File(path).writeAsBytes(await File(normalizedPath).readAsBytes(), flush: true);
-    } catch (_) {
-    } finally {
-      if (normalizedPath != null) {
-        final file = File(normalizedPath);
-        if (await file.exists()) await file.delete();
-      }
-    }
-  }
-
-  String _ffmpegPath(String path) => path.replaceAll('"', r'\"');
-
   Future<void> _padWav(String path) async {
     if (widget.item.durationMs <= 0) return;
     final file = File(path);
     final bytes = await file.readAsBytes();
     if (bytes.length < 44) return;
-    final targetFrames = (widget.item.durationMs * 44100 / 1000).round();
-    final targetLength = targetFrames * 2;
+    final sampleRate = Platform.isWindows ? 48000 : 44100;
+    final channels = Platform.isWindows ? 2 : 1;
+    final targetFrames = (widget.item.durationMs * sampleRate / 1000).round();
+    final targetLength = targetFrames * channels * 2;
     final currentLength = bytes.length - 44;
     final output = BytesBuilder()..add(bytes.sublist(0, 44))..add(bytes.sublist(44, 44 + min(currentLength, targetLength)));
     if (targetLength > currentLength) output.add(Uint8List(targetLength - currentLength));
