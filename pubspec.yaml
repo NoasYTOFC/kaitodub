@@ -1,0 +1,41 @@
+name: kaitodub
+description: "A new Flutter project."
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+  archive: ^4.0.7
+  audioplayers: ^6.5.0
+  file_picker: ^10.3.3
+  ffmpeg_kit_flutter_new: ^4.6.2
+  just_waveform: ^0.0.7
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  permission_handler: ^12.0.1
+  record: ^6.1.2
+  sembast: ^3.8.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: icon/icon.png
+  adaptive_icon_background: '#08111F'
+  adaptive_icon_foreground: icon/icon.png
+  windows:
+    generate: true
+    image_path: icon/icon.png
+    icon_size: 256
+
+flutter:
+  uses-material-design: true
