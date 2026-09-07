@@ -457,11 +457,11 @@ class _AudioPageState extends State<AudioPage> {
     }
   }
 
-  Future<void> _extractDesktopWaveform({int? sourceDurationMs}) async {
+  Future<void> _extractDesktopWaveform({String? audioPath, int? sourceDurationMs, bool recorded = false}) async {
     final directory = await getTemporaryDirectory();
     final pcmPath = p.join(directory.path, '${widget.item.id}.pcm');
     try {
-      final session = await FFmpegKit.execute('-y -i "${widget.item.sourcePath}" -ac 1 -ar 8000 -f s16le "$pcmPath"');
+      final session = await FFmpegKit.execute('-y -i "${audioPath ?? widget.item.sourcePath}" -ac 1 -ar 8000 -f s16le "$pcmPath"');
       final code = await session.getReturnCode();
       if (code == null || !ReturnCode.isSuccess(code) || !await File(pcmPath).exists()) throw const FormatException();
       final bytes = await File(pcmPath).readAsBytes();
@@ -473,8 +473,12 @@ class _AudioPageState extends State<AudioPage> {
       }
       if (mounted) {
         setState(() {
-          _sourceWaveform = values;
-          if (sourceDurationMs == null) {
+          if (recorded) {
+            _recordedWaveform = values;
+          } else {
+            _sourceWaveform = values;
+          }
+          if (!recorded && sourceDurationMs == null) {
             widget.item.durationMs = values.length * 1000 ~/ 8000;
           }
         });
@@ -526,15 +530,9 @@ class _AudioPageState extends State<AudioPage> {
       final directory = await getTemporaryDirectory();
       final path = p.join(directory.path, '${widget.item.id}.wav');
       _amplitudes.clear();
-      final device = Platform.isWindows ? _selectedDevice : null;
-      final sampleRate = Platform.isWindows ? 48000 : 44100;
-      final channels = Platform.isWindows ? 2 : 1;
-      try {
-        await _recorder.start(RecordConfig(encoder: AudioEncoder.wav, sampleRate: sampleRate, numChannels: channels, device: device), path: path);
-      } catch (_) {
-        if (!Platform.isWindows || device == null) rethrow;
-        await _recorder.start(RecordConfig(encoder: AudioEncoder.wav, sampleRate: sampleRate, numChannels: channels), path: path);
-      }
+      const sampleRate = 44100;
+      const channels = 1;
+      await _recorder.start(RecordConfig(encoder: AudioEncoder.wav, sampleRate: sampleRate, numChannels: channels, device: _selectedDevice), path: path);
       final startedAt = DateTime.now();
       if (mounted) setState(() { _recording = true; _progress = 0; });
       _progressTimer = Timer.periodic(const Duration(milliseconds: 30), (_) {
@@ -553,12 +551,14 @@ class _AudioPageState extends State<AudioPage> {
         setState(() { _recording = false; widget.item.recordingPath = recordingPath; });
         await widget.database.save(await _sessionContainingItem());
         widget.onChanged();
-        await _padWav(recordingPath);
+        await _normalizeRecordedWav(recordingPath);
         await _extractRecordedWaveform(recordingPath);
         widget.onChanged();
       }
     } catch (error) {
       await _amplitudeSubscription?.cancel();
+      _progressTimer?.cancel();
+      await _recorder.cancel();
       if (mounted) {
         setState(() => _recording = false);
         _message('Não foi possível iniciar o microfone: $error');
@@ -567,6 +567,10 @@ class _AudioPageState extends State<AudioPage> {
   }
 
   Future<void> _extractRecordedWaveform(String path) async {
+    if (Platform.isWindows || Platform.isLinux) {
+      await _extractDesktopWaveform(audioPath: path, recorded: true);
+      return;
+    }
     try {
       final directory = await getTemporaryDirectory();
       final outputPath = p.join(directory.path, '${widget.item.id}.dub.waveform');
@@ -580,27 +584,23 @@ class _AudioPageState extends State<AudioPage> {
     }
   }
 
-  Future<void> _padWav(String path) async {
-    if (widget.item.durationMs <= 0) return;
-    final file = File(path);
-    final bytes = await file.readAsBytes();
-    if (bytes.length < 44) return;
-    final sampleRate = Platform.isWindows ? 48000 : 44100;
-    final channels = Platform.isWindows ? 2 : 1;
-    final targetFrames = (widget.item.durationMs * sampleRate / 1000).round();
-    final targetLength = targetFrames * channels * 2;
-    final currentLength = bytes.length - 44;
-    final output = BytesBuilder()..add(bytes.sublist(0, 44))..add(bytes.sublist(44, 44 + min(currentLength, targetLength)));
-    if (targetLength > currentLength) output.add(Uint8List(targetLength - currentLength));
-    final result = output.takeBytes();
-    _writeLittleEndian(result, 4, result.length - 8);
-    _writeLittleEndian(result, 40, targetLength);
-    await file.writeAsBytes(result);
-  }
-
-  void _writeLittleEndian(Uint8List bytes, int offset, int value) {
-    for (var index = 0; index < 4; index++) {
-      bytes[offset + index] = (value >> (index * 8)) & 0xff;
+  Future<void> _normalizeRecordedWav(String path) async {
+    if (!Platform.isWindows && !Platform.isLinux) return;
+    final targetDurationMs = max(1, widget.item.durationMs);
+    final directory = await getTemporaryDirectory();
+    final normalizedPath = p.join(directory.path, '${widget.item.id}.normalized.wav');
+    final targetSeconds = (targetDurationMs / 1000).toStringAsFixed(3);
+    try {
+      final session = await FFmpegKit.execute('-y -i "$path" -ac 1 -ar 44100 -c:a pcm_s16le -af "loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur=$targetSeconds" -t $targetSeconds "$normalizedPath"');
+      final code = await session.getReturnCode();
+      if (code == null || !ReturnCode.isSuccess(code) || !await File(normalizedPath).exists()) {
+        return;
+      }
+      await File(path).writeAsBytes(await File(normalizedPath).readAsBytes(), flush: true);
+    } catch (_) {
+    } finally {
+      final normalizedFile = File(normalizedPath);
+      if (await normalizedFile.exists()) await normalizedFile.delete();
     }
   }
 
@@ -629,6 +629,7 @@ class WavePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()..color = color.withValues(alpha: .85)..strokeWidth = 2;
+    if (values.isEmpty) return;
     final count = max(1, min(values.length, (size.width / 4).floor()));
     for (var index = 0; index < count; index++) {
       final value = values[index * values.length ~/ count].abs().clamp(.04, 1.0);
