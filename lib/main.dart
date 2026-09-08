@@ -10,11 +10,16 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/material.dart';
 import 'package:just_waveform/just_waveform.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:sembast/sembast_io.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import 'github_release_service.dart';
 
 void main() => runApp(const KaitoDubsApp());
 
@@ -113,6 +118,7 @@ class _LibraryPageState extends State<LibraryPage> {
   final _database = DubDatabase();
   List<DubSession> _sessions = [];
   bool _busy = false;
+  bool _updateCheckCompleted = false;
   double? _busyProgress;
   String _busyMessage = 'Carregando sessões...';
 
@@ -127,6 +133,57 @@ class _LibraryPageState extends State<LibraryPage> {
     _sessions = await _database.load();
     await _hydrateDurations(_sessions.expand((session) => session.items));
     if (mounted) setState(() => _busy = false);
+    await _checkForUpdate();
+  }
+
+  Future<void> _checkForUpdate() async {
+    if (_updateCheckCompleted) return;
+    _updateCheckCompleted = true;
+    final packageInfo = await PackageInfo.fromPlatform();
+    final release = await const GithubReleaseService().latestRelease(owner: 'NoasYTOFC', repository: 'kaitodub');
+    if (!mounted || release == null || !isNewerVersion(release.version, packageInfo.version)) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Nova versão disponível'),
+        content: Text('${release.name}\n\nVersão instalada: ${packageInfo.version}\nNova versão: ${release.version}'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Depois')),
+          FilledButton.icon(
+            onPressed: () async {
+              if (Platform.isAndroid && release.apkUrl != null) {
+                await _downloadAndInstallAndroid(release.apkUrl!, release.version);
+              } else {
+                await launchUrl(Uri.parse(release.url), mode: LaunchMode.externalApplication);
+              }
+              if (context.mounted) Navigator.pop(context);
+            },
+            icon: Icon(Platform.isAndroid && release.apkUrl != null ? Icons.download_rounded : Icons.open_in_new_rounded),
+            label: Text(Platform.isAndroid && release.apkUrl != null ? 'Instalar Android' : 'Abrir release'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _downloadAndInstallAndroid(String apkUrl, String version) async {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Baixando atualização...')));
+    try {
+      final request = await HttpClient().getUrl(Uri.parse(apkUrl));
+      request.headers.set(HttpHeaders.userAgentHeader, 'KaitoDub');
+      final response = await request.close();
+      if (response.statusCode != HttpStatus.ok) throw const HttpException('Download da atualização falhou.');
+      final directory = await getTemporaryDirectory();
+      final apkPath = p.join(directory.path, 'kaitodub-$version.apk');
+      final file = File(apkPath);
+      await response.pipe(file.openWrite());
+      final result = await OpenFilex.open(apkPath, type: 'application/vnd.android.package-archive');
+      if (!mounted || result.type == ResultType.done) return;
+      _message('Não foi possível abrir o instalador: ${result.message}');
+    } catch (error) {
+      if (mounted) _message('Não foi possível baixar a atualização: $error');
+    }
   }
 
   Future<void> _hydrateDurations(Iterable<AudioItem> items, {void Function(double progress)? onProgress}) async {
@@ -232,7 +289,7 @@ class _LibraryPageState extends State<LibraryPage> {
         const SizedBox(height: 8),
         const Text('Cada arquivo permanece salvo no aplicativo até ser exportado.', style: TextStyle(color: Colors.white54)),
         const SizedBox(height: 24),
-        ..._sessions.map((session) => _librarySummary(session)),
+        _libraryTotalSummary(),
         const SizedBox(height: 10),
         ..._sessions.map((session) => Card(child: ListTile(
               onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SessionPage(session: session, database: _database, onChanged: _load))),
@@ -252,13 +309,11 @@ class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
-  Widget _librarySummary(DubSession session) {
-    final total = totalDuration(session.items);
-    final done = confirmedDuration(session.items);
-    final progress = total == 0 ? 0.0 : (done / total).clamp(0.0, 1.0);
+  Widget _libraryTotalSummary() {
+    final items = _sessions.expand((session) => session.items).toList();
+    final total = totalDuration(items);
     return Padding(padding: const EdgeInsets.only(bottom: 14), child: Row(children: [
-      Expanded(child: Text('${formatDuration(total)}  •  ${(progress * 100).round()}%', style: const TextStyle(fontWeight: FontWeight.w700))),
-      SizedBox(width: 180, child: LinearProgressIndicator(value: progress)),
+      Expanded(child: Text('Tempo total em dublagem: ${formatDuration(total)}', style: const TextStyle(fontWeight: FontWeight.w700))),
     ]));
   }
 }
@@ -612,10 +667,29 @@ class _AudioPageState extends State<AudioPage> {
     savedItem.confirmed = widget.item.confirmed;
     return session;
   }
+  Future<void> _ignoreAudio() async {
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Ignorar áudio?'),
+        content: const Text('Certeza que deseja ignorar esse áudio?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Não')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Sim')),
+        ],
+      ),
+    );
+    if (accepted != true || !mounted) return;
+    setState(() => widget.item.confirmed = true);
+    await widget.database.save(await _sessionContainingItem());
+    widget.onChanged();
+    _message('Áudio ignorado e marcado como confirmado.');
+  }
+
   void _message(String text) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text))); }
 
   @override
-  Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: Text(widget.item.name)), body: ListView(padding: const EdgeInsets.all(24), children: [const Text('Áudio original', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)), const SizedBox(height: 10), if (_countdown > 0) ...[LinearProgressIndicator(value: _countdownProgress), const SizedBox(height: 8), Text('Começando em $_countdown', textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)), const SizedBox(height: 8)], _waveform(_sourceWaveform, Theme.of(context).colorScheme.primary, progress: _recording ? _progress : null), const SizedBox(height: 16), if (_devices.isNotEmpty) DropdownButtonFormField<InputDevice>(initialValue: _selectedDevice, decoration: const InputDecoration(labelText: 'Microfone de gravação'), items: _devices.map((device) => DropdownMenuItem(value: device, child: Text(device.label))).toList(), onChanged: _recording ? null : (device) => setState(() => _selectedDevice = device)), if (_devices.isNotEmpty) const SizedBox(height: 12), Row(children: [IconButton.filled(onPressed: () => _player.play(DeviceFileSource(widget.item.sourcePath)), tooltip: 'Ouvir original', icon: const Icon(Icons.play_arrow_rounded)), IconButton(onPressed: _recording ? null : () => setState(() => _timerEnabled = !_timerEnabled), tooltip: 'Temporizador', color: _timerEnabled ? Theme.of(context).colorScheme.primary : null, icon: const Icon(Icons.timer_outlined)), FilledButton.icon(onPressed: _recording || _countdown > 0 ? null : _record, icon: const Icon(Icons.mic_none_rounded), label: Text(_recording ? 'Gravando...' : _countdown > 0 ? '$_countdown' : 'Gravar'))]), if (_recording) ...[const SizedBox(height: 22), const Text('Gravando agora', style: TextStyle(fontWeight: FontWeight.w700)), const SizedBox(height: 8), _waveform(_amplitudes, Colors.redAccent)], if (widget.item.recordingPath != null && !_recording) ...[const SizedBox(height: 30), const Text('Sua dublagem', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)), const SizedBox(height: 10), _waveform(_recordedWaveform, Colors.greenAccent), Row(children: [IconButton.filled(onPressed: () => _player.play(DeviceFileSource(widget.item.recordingPath!)), tooltip: 'Ouvir dublagem', icon: const Icon(Icons.play_arrow_rounded)), OutlinedButton.icon(onPressed: () async { setState(() => widget.item.confirmed = true); await widget.database.save(await _sessionContainingItem()); widget.onChanged(); }, icon: const Icon(Icons.check_rounded), label: Text(widget.item.confirmed ? 'Confirmada' : 'Confirmar'))])]]));
+  Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: Text(widget.item.name)), body: ListView(padding: const EdgeInsets.all(24), children: [const Text('Áudio original', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)), const SizedBox(height: 10), if (_countdown > 0) ...[LinearProgressIndicator(value: _countdownProgress), const SizedBox(height: 8), Text('Começando em $_countdown', textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)), const SizedBox(height: 8)], _waveform(_sourceWaveform, Theme.of(context).colorScheme.primary, progress: _recording ? _progress : null), const SizedBox(height: 16), if (_devices.isNotEmpty) DropdownButtonFormField<InputDevice>(initialValue: _selectedDevice, decoration: const InputDecoration(labelText: 'Microfone de gravação'), items: _devices.map((device) => DropdownMenuItem(value: device, child: Text(device.label))).toList(), onChanged: _recording ? null : (device) => setState(() => _selectedDevice = device)), if (_devices.isNotEmpty) const SizedBox(height: 12), Row(children: [IconButton.filled(onPressed: () => _player.play(DeviceFileSource(widget.item.sourcePath)), tooltip: 'Ouvir original', icon: const Icon(Icons.play_arrow_rounded)), IconButton(onPressed: _recording ? null : () => setState(() => _timerEnabled = !_timerEnabled), tooltip: 'Temporizador', color: _timerEnabled ? Theme.of(context).colorScheme.primary : null, icon: const Icon(Icons.timer_outlined)), FilledButton.icon(onPressed: _recording || _countdown > 0 ? null : _record, icon: const Icon(Icons.mic_none_rounded), label: Text(_recording ? 'Gravando...' : _countdown > 0 ? '$_countdown' : 'Gravar')), const SizedBox(width: 8), OutlinedButton.icon(onPressed: _recording || _countdown > 0 || widget.item.confirmed ? null : _ignoreAudio, icon: const Icon(Icons.skip_next_rounded), label: const Text('Ignorar'))]), if (_recording) ...[const SizedBox(height: 22), const Text('Gravando agora', style: TextStyle(fontWeight: FontWeight.w700)), const SizedBox(height: 8), _waveform(_amplitudes, Colors.redAccent)], if (widget.item.recordingPath != null && !_recording) ...[const SizedBox(height: 30), const Text('Sua dublagem', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)), const SizedBox(height: 10), _waveform(_recordedWaveform, Colors.greenAccent), Row(children: [IconButton.filled(onPressed: () => _player.play(DeviceFileSource(widget.item.recordingPath!)), tooltip: 'Ouvir dublagem', icon: const Icon(Icons.play_arrow_rounded)), OutlinedButton.icon(onPressed: () async { setState(() => widget.item.confirmed = true); await widget.database.save(await _sessionContainingItem()); widget.onChanged(); }, icon: const Icon(Icons.check_rounded), label: Text(widget.item.confirmed ? 'Confirmada' : 'Confirmar'))])]]));
 
   Widget _waveform(List<double> values, Color color, {double? progress}) => Align(alignment: Alignment.center, child: Container(height: 130, width: progress == null ? double.infinity : min(MediaQuery.of(context).size.width - 48, 620) * .72, decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)), child: Stack(children: [CustomPaint(painter: WavePainter(values, color, progress: progress), child: const SizedBox.expand()), if (progress != null) const Positioned.fill(child: CustomPaint(painter: ProgressPainter()))])));
 }
