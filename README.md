@@ -38,10 +38,11 @@ flutter build windows --debug
 
 ## Fluxo de uso
 
-1. Importe vários áudios ou um ZIP contendo os áudios originais.
+1. Importe vários arquivos de áudio ou ZIPs.
 2. Dê um nome à pasta criada para organizar os arquivos do personagem.
-3. Abra a pasta e selecione o microfone do Windows.
-4. Grave cada dublagem usando o temporizador opcional.
+3. Abra a pasta para ver cada arquivo separadamente.
+4. Abra um arquivo para ver e dublar seus áudios.
+5. Selecione o microfone do Windows e grave usando o temporizador opcional.
 4. Reproduza e confirme as gravações.
 5. Exporte a sessão para um novo arquivo ZIP.
 

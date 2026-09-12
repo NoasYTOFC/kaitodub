@@ -58,6 +58,13 @@ class DubSession {
   final List<AudioItem> items;
 }
 
+class DubFolder {
+  DubFolder({required this.id, required this.name, required this.sessions});
+  final String id;
+  final String name;
+  final List<DubSession> sessions;
+}
+
 String formatDuration(int milliseconds) {
   final totalSeconds = (milliseconds / 1000).round();
   final hours = totalSeconds ~/ 3600;
@@ -71,6 +78,7 @@ int totalDuration(List<AudioItem> items) => items.fold(0, (total, item) => total
 int confirmedDuration(List<AudioItem> items) => items.where((item) => item.confirmed).fold(0, (total, item) => total + item.durationMs);
 
 final _store = stringMapStoreFactory.store('sessions');
+final _folderStore = stringMapStoreFactory.store('folders');
 
 class DubDatabase {
   Database? _db;
@@ -83,28 +91,67 @@ class DubDatabase {
     return _db!;
   }
 
-  Future<List<DubSession>> load() async {
-    final records = await _store.find(await database, finder: Finder(sortOrders: [SortOrder('createdAt', false)]));
-    return records.map((record) {
+  DubSession _sessionFromData(String id, Map<String, dynamic> data) {
+    final items = (data['items'] as List<dynamic>).map((raw) {
+      final value = Map<String, dynamic>.from(raw as Map);
+      return AudioItem(id: value['id'] as String, name: value['name'] as String, sourcePath: value['sourcePath'] as String, extension: value['extension'] as String, durationMs: value['durationMs'] as int? ?? 0, recordingPath: value['recordingPath'] as String?, confirmed: value['confirmed'] as bool? ?? false);
+    }).toList();
+    return DubSession(id: id, name: data['name'] as String, items: items);
+  }
+
+  Future<List<DubFolder>> loadFolders() async {
+    final db = await database;
+    final folders = await _folderStore.find(db, finder: Finder(sortOrders: [SortOrder('createdAt', false)]));
+    final result = folders.map((record) {
       final data = record.value;
-      final items = (data['items'] as List<dynamic>).map((raw) {
+      final sessions = (data['sessions'] as List<dynamic>).map((raw) {
         final value = Map<String, dynamic>.from(raw as Map);
-        return AudioItem(id: value['id'] as String, name: value['name'] as String, sourcePath: value['sourcePath'] as String, extension: value['extension'] as String, durationMs: value['durationMs'] as int? ?? 0, recordingPath: value['recordingPath'] as String?, confirmed: value['confirmed'] as bool? ?? false);
+        return _sessionFromData(value['id'] as String, value);
       }).toList();
-      return DubSession(id: record.key, name: data['name'] as String, items: items);
+      return DubFolder(id: record.key, name: data['name'] as String, sessions: sessions);
+    }).toList();
+    if (result.isNotEmpty) return result;
+    final legacy = await _store.find(db, finder: Finder(sortOrders: [SortOrder('createdAt', false)]));
+    return legacy.map((record) {
+      final session = _sessionFromData(record.key, Map<String, dynamic>.from(record.value));
+      return DubFolder(id: session.id, name: session.name, sessions: [session]);
     }).toList();
   }
 
   Future<void> save(DubSession session) async {
-    await _store.record(session.id).put(await database, {
+    await _store.record(session.id).put(await database, _sessionData(session));
+  }
+
+  Map<String, dynamic> _sessionData(DubSession session) => {
       'name': session.name,
-      'createdAt': DateTime.now().millisecondsSinceEpoch,
+      'id': session.id,
       'items': session.items.map((item) => {'id': item.id, 'name': item.name, 'sourcePath': item.sourcePath, 'extension': item.extension, 'durationMs': item.durationMs, 'recordingPath': item.recordingPath, 'confirmed': item.confirmed}).toList(),
+    };
+
+  Future<void> saveFolder(DubFolder folder) async {
+    await _folderStore.record(folder.id).put(await database, {
+      'name': folder.name,
+      'createdAt': DateTime.now().millisecondsSinceEpoch,
+      'sessions': folder.sessions.map(_sessionData).toList(),
     });
   }
 
   Future<void> delete(String sessionId) async {
     await _store.record(sessionId).delete(await database);
+  }
+
+  Future<void> deleteFolder(String folderId) async {
+    await _folderStore.record(folderId).delete(await database);
+  }
+
+  Future<List<DubSession>> load() async => (await loadFolders()).expand((folder) => folder.sessions).toList();
+
+  Future<void> updateSession(DubSession session) async {
+    final folders = await loadFolders();
+    final folder = folders.firstWhere((folder) => folder.sessions.any((saved) => saved.id == session.id));
+    final index = folder.sessions.indexWhere((saved) => saved.id == session.id);
+    folder.sessions[index] = session;
+    await saveFolder(folder);
   }
 }
 
@@ -116,7 +163,7 @@ class LibraryPage extends StatefulWidget {
 
 class _LibraryPageState extends State<LibraryPage> {
   final _database = DubDatabase();
-  List<DubSession> _sessions = [];
+  List<DubFolder> _folders = [];
   bool _busy = false;
   bool _updateCheckCompleted = false;
   double? _busyProgress;
@@ -130,12 +177,14 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> _load() async {
     setState(() { _busy = true; _busyProgress = null; _busyMessage = 'Carregando sessões...'; });
-    _sessions = await _database.load();
-    _sessions.sort((first, second) => second.items.length.compareTo(first.items.length));
-    await _hydrateDurations(_sessions.expand((session) => session.items));
+    _folders = await _database.loadFolders();
+    _folders.sort((first, second) => _folderItemCount(second).compareTo(_folderItemCount(first)));
+    await _hydrateDurations(_folders.expand((folder) => folder.sessions).expand((session) => session.items));
     if (mounted) setState(() => _busy = false);
     await _checkForUpdate();
   }
+
+  int _folderItemCount(DubFolder folder) => folder.sessions.fold(0, (total, session) => total + session.items.length);
 
   Future<void> _checkForUpdate() async {
     if (_updateCheckCompleted) return;
@@ -246,8 +295,8 @@ class _LibraryPageState extends State<LibraryPage> {
         if (duration != null) item.durationMs = duration.inMilliseconds;
         onProgress?.call((index + 1) / pendingItems.length);
       }
-      for (final session in _sessions) {
-        await _database.save(session);
+      for (final folder in _folders) {
+        await _database.saveFolder(folder);
       }
     } finally {
       await player.dispose();
@@ -288,10 +337,10 @@ class _LibraryPageState extends State<LibraryPage> {
     setState(() { _busy = true; _busyProgress = 0; _busyMessage = 'Extraindo áudios...'; });
     try {
       final root = await getApplicationSupportDirectory();
-      final sessionId = DateTime.now().microsecondsSinceEpoch.toString();
-      final folder = Directory(p.join(root.path, 'sessions', sessionId));
+      final folderId = DateTime.now().microsecondsSinceEpoch.toString();
+      final folder = Directory(p.join(root.path, 'sessions', folderId));
       await folder.create(recursive: true);
-      final items = <AudioItem>[];
+      final sessions = <DubSession>[];
       final totalFiles = result.files.length;
       for (var fileIndex = 0; fileIndex < result.files.length; fileIndex++) {
         final selectedFile = result.files[fileIndex];
@@ -305,28 +354,35 @@ class _LibraryPageState extends State<LibraryPage> {
           if (bytes == null) continue;
           final archive = ZipDecoder().decodeBytes(bytes);
           final audioEntries = archive.files.where((entry) => entry.isFile && audioExtensions.contains(p.extension(entry.name).toLowerCase())).toList();
+          final sessionId = '$folderId-$fileIndex';
+          final sessionFolder = Directory(p.join(folder.path, sessionId));
+          await sessionFolder.create(recursive: true);
+          final items = <AudioItem>[];
           for (final entry in audioEntries) {
             final entryExtension = p.extension(entry.name).toLowerCase();
-            final path = p.join(folder.path, '${items.length}$entryExtension');
+            final path = p.join(sessionFolder.path, '${items.length}$entryExtension');
             await File(path).writeAsBytes(entry.content as List<int>);
             items.add(AudioItem(id: '$sessionId-${items.length}', name: p.basenameWithoutExtension(entry.name), sourcePath: path, extension: entryExtension));
           }
+          if (items.isNotEmpty) sessions.add(DubSession(id: sessionId, name: p.basenameWithoutExtension(selectedFile.name), items: items));
         } else if (audioExtensions.contains(extension)) {
           final bytes = selectedFile.bytes ?? (selectedFile.path == null ? null : await File(selectedFile.path!).readAsBytes());
           if (bytes == null) continue;
-          final path = p.join(folder.path, '${items.length}$extension');
+          final sessionId = '$folderId-$fileIndex';
+          final sessionFolder = Directory(p.join(folder.path, sessionId));
+          await sessionFolder.create(recursive: true);
+          final path = p.join(sessionFolder.path, '0$extension');
           await File(path).writeAsBytes(bytes);
-          items.add(AudioItem(id: '$sessionId-${items.length}', name: p.basenameWithoutExtension(selectedFile.name), sourcePath: path, extension: extension));
+          sessions.add(DubSession(id: sessionId, name: p.basenameWithoutExtension(selectedFile.name), items: [AudioItem(id: '$sessionId-0', name: p.basenameWithoutExtension(selectedFile.name), sourcePath: path, extension: extension)]));
         }
         if (mounted) setState(() => _busyProgress = (fileIndex + 1) / totalFiles * .5);
       }
-      if (items.isEmpty) throw const FormatException();
-      final session = DubSession(id: sessionId, name: folderName, items: items);
+      if (sessions.isEmpty) throw const FormatException();
       if (mounted) setState(() { _busyMessage = 'Lendo durações dos áudios...'; _busyProgress = .5; });
-      await _hydrateDurations(items, onProgress: (progress) {
+      await _hydrateDurations(sessions.expand((session) => session.items), onProgress: (progress) {
         if (mounted) setState(() => _busyProgress = .5 + progress * .45);
       });
-      await _database.save(session);
+      await _database.saveFolder(DubFolder(id: folderId, name: folderName, sessions: sessions));
       await _load();
     } catch (_) {
       _message('Não foi possível importar este ZIP ou ele não contém áudio.');
@@ -334,12 +390,12 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  Future<void> _deleteSession(DubSession session) async {
+  Future<void> _deleteFolder(DubFolder folderData) async {
     final accepted = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Excluir pasta?'),
-        content: Text('A sessão "${session.name}" e todos os seus áudios serão removidos do aplicativo.'),
+        content: Text('A pasta "${folderData.name}" e todos os seus arquivos serão removidos do aplicativo.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')),
           FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Excluir')),
@@ -347,9 +403,9 @@ class _LibraryPageState extends State<LibraryPage> {
       ),
     );
     if (accepted != true) return;
-    await _database.delete(session.id);
-    final folder = session.items.isEmpty ? null : Directory(p.dirname(session.items.first.sourcePath));
-    if (folder != null && await folder.exists()) await folder.delete(recursive: true);
+    await _database.deleteFolder(folderData.id);
+    final folder = Directory(p.join((await getApplicationSupportDirectory()).path, 'sessions', folderData.id));
+    if (await folder.exists()) await folder.delete(recursive: true);
     await _load();
   }
 
@@ -367,7 +423,7 @@ class _LibraryPageState extends State<LibraryPage> {
         Text(_busyMessage, style: const TextStyle(color: Colors.white70)),
         if (_busyProgress != null) ...[const SizedBox(height: 6), Text('${(_busyProgress! * 100).round()}%', style: const TextStyle(color: Colors.white54))],
       ]));
-    } else if (_sessions.isEmpty) {
+    } else if (_folders.isEmpty) {
       content = Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
         const Text('Importe seus áudios para criar sua primeira pasta.', style: TextStyle(color: Colors.white54)),
         const SizedBox(height: 16),
@@ -381,23 +437,25 @@ class _LibraryPageState extends State<LibraryPage> {
         const SizedBox(height: 24),
         _libraryTotalSummary(),
         const SizedBox(height: 10),
-        ..._sessions.map((session) {
-          final total = totalDuration(session.items);
-          final confirmed = session.items.where((item) => item.confirmed).length;
-          final progress = total == 0 ? 0.0 : (confirmedDuration(session.items) / total).clamp(0.0, 1.0);
+        ..._folders.map((folderData) {
+          final sessions = folderData.sessions;
+          final items = sessions.expand((session) => session.items).toList();
+          final total = totalDuration(items);
+          final confirmed = items.where((item) => item.confirmed).length;
+          final progress = total == 0 ? 0.0 : (confirmedDuration(items) / total).clamp(0.0, 1.0);
           return Card(child: ListTile(
-              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SessionPage(session: session, database: _database, onChanged: _load))),
+              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => FolderPage(folder: folderData, database: _database, onChanged: _load))),
               leading: Icon(Icons.folder_zip_outlined, color: Theme.of(context).colorScheme.primary),
-              title: Text(session.name),
+              title: Text(folderData.name),
               subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 const SizedBox(height: 4),
-                Text('$confirmed de ${session.items.length} áudios confirmados'),
+                Text('${sessions.length} arquivo(s)  •  $confirmed de ${items.length} áudios confirmados'),
                 Text('Tempo total: ${formatDuration(total)}', style: const TextStyle(color: Colors.white60)),
                 const SizedBox(height: 6),
                 LinearProgressIndicator(value: progress),
               ]),
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                IconButton(onPressed: _busy ? null : () => _deleteSession(session), tooltip: 'Excluir pasta', icon: const Icon(Icons.delete_outline_rounded)),
+                IconButton(onPressed: _busy ? null : () => _deleteFolder(folderData), tooltip: 'Excluir pasta', icon: const Icon(Icons.delete_outline_rounded)),
                 const Icon(Icons.chevron_right_rounded),
               ]),
             ));
@@ -411,11 +469,51 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   Widget _libraryTotalSummary() {
-    final items = _sessions.expand((session) => session.items).toList();
+    final items = _folders.expand((folder) => folder.sessions).expand((session) => session.items).toList();
     final total = totalDuration(items);
     return Padding(padding: const EdgeInsets.only(bottom: 14), child: Row(children: [
       Expanded(child: Text('Tempo total em dublagem: ${formatDuration(total)}', style: const TextStyle(fontWeight: FontWeight.w700))),
     ]));
+  }
+}
+
+class FolderPage extends StatefulWidget {
+  const FolderPage({required this.folder, required this.database, required this.onChanged, super.key});
+  final DubFolder folder;
+  final DubDatabase database;
+  final VoidCallback onChanged;
+
+  @override
+  State<FolderPage> createState() => _FolderPageState();
+}
+
+class _FolderPageState extends State<FolderPage> {
+  @override
+  Widget build(BuildContext context) {
+    final items = widget.folder.sessions.expand((session) => session.items).toList();
+    final total = totalDuration(items);
+    final confirmed = items.where((item) => item.confirmed).length;
+    final progress = total == 0 ? 0.0 : (confirmedDuration(items) / total).clamp(0.0, 1.0);
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.folder.name)),
+      body: ListView(padding: const EdgeInsets.all(24), children: [
+        Text('$confirmed de ${items.length} áudios confirmados'),
+        const SizedBox(height: 6),
+        Text('Tempo total: ${formatDuration(total)}', style: const TextStyle(color: Colors.white60)),
+        const SizedBox(height: 8),
+        LinearProgressIndicator(value: progress),
+        const SizedBox(height: 24),
+        ...widget.folder.sessions.map((session) => Card(
+              child: ListTile(
+                leading: const Icon(Icons.insert_drive_file_outlined),
+                title: Text(session.name),
+                subtitle: Text('${session.items.length} áudio(s)  •  ${session.items.where((item) => item.confirmed).length} confirmados'),
+                trailing: const Icon(Icons.chevron_right_rounded),
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SessionPage(session: session, database: widget.database, onChanged: () { widget.onChanged(); setState(() {}); }))),
+              ),
+            )),
+      ]),
+    );
   }
 }
 
@@ -705,7 +803,7 @@ class _AudioPageState extends State<AudioPage> {
       if (!await File(recordingPath).exists()) throw const FileSystemException('O arquivo da gravação não foi criado.');
       if (mounted) {
         setState(() { _recording = false; widget.item.recordingPath = recordingPath; });
-        await widget.database.save(await _sessionContainingItem());
+        await _sessionContainingItem();
         widget.onChanged();
         await _normalizeRecordedWav(recordingPath);
         await _extractRecordedWaveform(recordingPath);
@@ -761,11 +859,12 @@ class _AudioPageState extends State<AudioPage> {
   }
 
   Future<DubSession> _sessionContainingItem() async {
-    final session = (await widget.database.load()).firstWhere((session) => session.items.any((item) => item.id == widget.item.id));
+    final session = (await widget.database.loadFolders()).expand((folder) => folder.sessions).firstWhere((session) => session.items.any((item) => item.id == widget.item.id));
     final savedItem = session.items.firstWhere((item) => item.id == widget.item.id);
     savedItem.durationMs = widget.item.durationMs;
     savedItem.recordingPath = widget.item.recordingPath;
     savedItem.confirmed = widget.item.confirmed;
+    await widget.database.updateSession(session);
     return session;
   }
   Future<void> _ignoreAudio() async {
@@ -782,7 +881,7 @@ class _AudioPageState extends State<AudioPage> {
     );
     if (accepted != true || !mounted) return;
     setState(() => widget.item.confirmed = true);
-    await widget.database.save(await _sessionContainingItem());
+    await _sessionContainingItem();
     widget.onChanged();
     _message('Áudio ignorado e marcado como confirmado.');
   }
