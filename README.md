@@ -4,7 +4,7 @@ Aplicativo Flutter para organizar sessões de dublagem de áudio em massa, princ
 
 ## Recursos
 
-- Importação de sessões a partir de arquivos ZIP.
+- Importação de vários arquivos de áudio e arquivos ZIP para uma pasta nomeada.
 - Reprodução do áudio original e seleção do microfone.
 - Gravação de dublagens com duração baseada no áudio original.
 - Waveforms do áudio original e da gravação.
@@ -38,9 +38,10 @@ flutter build windows --debug
 
 ## Fluxo de uso
 
-1. Importe um ZIP contendo os áudios originais.
-2. Abra uma sessão e selecione o microfone do Windows.
-3. Grave cada dublagem usando o temporizador opcional.
+1. Importe vários áudios ou um ZIP contendo os áudios originais.
+2. Dê um nome à pasta criada para organizar os arquivos do personagem.
+3. Abra a pasta e selecione o microfone do Windows.
+4. Grave cada dublagem usando o temporizador opcional.
 4. Reproduza e confirme as gravações.
 5. Exporte a sessão para um novo arquivo ZIP.
 

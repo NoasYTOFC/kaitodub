@@ -131,6 +131,7 @@ class _LibraryPageState extends State<LibraryPage> {
   Future<void> _load() async {
     setState(() { _busy = true; _busyProgress = null; _busyMessage = 'Carregando sessões...'; });
     _sessions = await _database.load();
+    _sessions.sort((first, second) => second.items.length.compareTo(first.items.length));
     await _hydrateDurations(_sessions.expand((session) => session.items));
     if (mounted) setState(() => _busy = false);
     await _checkForUpdate();
@@ -205,33 +206,74 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
+  Future<String?> _askFolderName() async {
+    final controller = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(builder: (context, setDialogState) {
+        final canCreate = controller.text.trim().isNotEmpty;
+        return AlertDialog(
+          title: const Text('Criar pasta'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Nome da pasta', hintText: 'Ex.: Personagem 01'),
+            onChanged: (_) => setDialogState(() {}),
+            onSubmitted: canCreate ? (_) => Navigator.pop(context, controller.text.trim()) : null,
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar')),
+            FilledButton(onPressed: canCreate ? () => Navigator.pop(context, controller.text.trim()) : null, child: const Text('Criar pasta')),
+          ],
+        );
+      }),
+    );
+  }
+
   Future<void> _import() async {
-    final result = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['zip', 'rar'], withData: true);
-    if (result == null || result.files.single.bytes == null) return;
-    if (p.extension(result.files.single.name).toLowerCase() == '.rar') {
-      _message('RAR foi reconhecido, mas a extração RAR ainda não está disponível. Use ZIP.');
-      return;
-    }
+    const audioExtensions = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus', '.wma'};
+    final result = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: [...audioExtensions.map((extension) => extension.substring(1)), 'zip', 'rar'], allowMultiple: true, withData: true);
+    if (result == null || result.files.isEmpty) return;
+    final folderName = await _askFolderName();
+    if (folderName == null || folderName.isEmpty) return;
     setState(() { _busy = true; _busyProgress = 0; _busyMessage = 'Extraindo áudios...'; });
     try {
-      final archive = ZipDecoder().decodeBytes(result.files.single.bytes!);
       final root = await getApplicationSupportDirectory();
       final sessionId = DateTime.now().microsecondsSinceEpoch.toString();
       final folder = Directory(p.join(root.path, 'sessions', sessionId));
       await folder.create(recursive: true);
-      const audioExtensions = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus', '.wma'};
       final items = <AudioItem>[];
-      final audioEntries = archive.files.where((entry) => entry.isFile && audioExtensions.contains(p.extension(entry.name).toLowerCase())).toList();
-      for (var index = 0; index < audioEntries.length; index++) {
-        final entry = audioEntries[index];
-        final extension = p.extension(entry.name);
-        final path = p.join(folder.path, '${items.length}$extension');
-        await File(path).writeAsBytes(entry.content as List<int>);
-        items.add(AudioItem(id: '$sessionId-${items.length}', name: p.basenameWithoutExtension(entry.name), sourcePath: path, extension: extension));
-        if (mounted) setState(() => _busyProgress = (index + 1) / audioEntries.length * .5);
+      final totalFiles = result.files.length;
+      for (var fileIndex = 0; fileIndex < result.files.length; fileIndex++) {
+        final selectedFile = result.files[fileIndex];
+        final extension = p.extension(selectedFile.name).toLowerCase();
+        if (extension == '.rar') {
+          _message('RAR foi ignorado porque a extração ainda não está disponível.');
+          continue;
+        }
+        if (extension == '.zip') {
+          final bytes = selectedFile.bytes;
+          if (bytes == null) continue;
+          final archive = ZipDecoder().decodeBytes(bytes);
+          final audioEntries = archive.files.where((entry) => entry.isFile && audioExtensions.contains(p.extension(entry.name).toLowerCase())).toList();
+          for (final entry in audioEntries) {
+            final entryExtension = p.extension(entry.name).toLowerCase();
+            final path = p.join(folder.path, '${items.length}$entryExtension');
+            await File(path).writeAsBytes(entry.content as List<int>);
+            items.add(AudioItem(id: '$sessionId-${items.length}', name: p.basenameWithoutExtension(entry.name), sourcePath: path, extension: entryExtension));
+          }
+        } else if (audioExtensions.contains(extension)) {
+          final bytes = selectedFile.bytes ?? (selectedFile.path == null ? null : await File(selectedFile.path!).readAsBytes());
+          if (bytes == null) continue;
+          final path = p.join(folder.path, '${items.length}$extension');
+          await File(path).writeAsBytes(bytes);
+          items.add(AudioItem(id: '$sessionId-${items.length}', name: p.basenameWithoutExtension(selectedFile.name), sourcePath: path, extension: extension));
+        }
+        if (mounted) setState(() => _busyProgress = (fileIndex + 1) / totalFiles * .5);
       }
       if (items.isEmpty) throw const FormatException();
-      final session = DubSession(id: sessionId, name: p.basenameWithoutExtension(result.files.single.name), items: items);
+      final session = DubSession(id: sessionId, name: folderName, items: items);
       if (mounted) setState(() { _busyMessage = 'Lendo durações dos áudios...'; _busyProgress = .5; });
       await _hydrateDurations(items, onProgress: (progress) {
         if (mounted) setState(() => _busyProgress = .5 + progress * .45);
@@ -279,32 +321,43 @@ class _LibraryPageState extends State<LibraryPage> {
       ]));
     } else if (_sessions.isEmpty) {
       content = Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-        const Text('Importe um ZIP para criar sua primeira sessão.', style: TextStyle(color: Colors.white54)),
+        const Text('Importe seus áudios para criar sua primeira pasta.', style: TextStyle(color: Colors.white54)),
         const SizedBox(height: 16),
-        FilledButton.icon(onPressed: _busy ? null : _import, icon: const Icon(Icons.file_upload_outlined), label: const Text('Importar arquivo')),
+        FilledButton.icon(onPressed: _busy ? null : _import, icon: const Icon(Icons.file_upload_outlined), label: const Text('Importar arquivos')),
       ]));
     } else {
       content = ListView(children: [
-        const Text('Arquivos importados', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w700)),
+        const Text('Pastas de dublagem', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w700)),
         const SizedBox(height: 8),
-        const Text('Cada arquivo permanece salvo no aplicativo até ser exportado.', style: TextStyle(color: Colors.white54)),
+        const Text('Cada pasta mantém seus áudios salvos no aplicativo até ser exportada.', style: TextStyle(color: Colors.white54)),
         const SizedBox(height: 24),
         _libraryTotalSummary(),
         const SizedBox(height: 10),
-        ..._sessions.map((session) => Card(child: ListTile(
+        ..._sessions.map((session) {
+          final total = totalDuration(session.items);
+          final confirmed = session.items.where((item) => item.confirmed).length;
+          final progress = total == 0 ? 0.0 : (confirmedDuration(session.items) / total).clamp(0.0, 1.0);
+          return Card(child: ListTile(
               onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SessionPage(session: session, database: _database, onChanged: _load))),
               leading: Icon(Icons.folder_zip_outlined, color: Theme.of(context).colorScheme.primary),
               title: Text(session.name),
-              subtitle: Text('${session.items.length} áudio(s)'),
+              subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const SizedBox(height: 4),
+                Text('$confirmed de ${session.items.length} áudios confirmados'),
+                Text('Tempo total: ${formatDuration(total)}', style: const TextStyle(color: Colors.white60)),
+                const SizedBox(height: 6),
+                LinearProgressIndicator(value: progress),
+              ]),
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                 IconButton(onPressed: _busy ? null : () => _deleteSession(session), tooltip: 'Excluir pasta', icon: const Icon(Icons.delete_outline_rounded)),
                 const Icon(Icons.chevron_right_rounded),
               ]),
-            )))
+            ));
+        })
       ]);
     }
     return Scaffold(
-      appBar: AppBar(title: const Text('KaitoDub', style: TextStyle(fontWeight: FontWeight.w800)), actions: [FilledButton.icon(onPressed: _busy ? null : _import, icon: const Icon(Icons.file_upload_outlined), label: const Text('Importar arquivo')), const SizedBox(width: 12)]),
+      appBar: AppBar(title: const Text('KaitoDub', style: TextStyle(fontWeight: FontWeight.w800)), actions: [FilledButton.icon(onPressed: _busy ? null : _import, icon: const Icon(Icons.file_upload_outlined), label: const Text('Importar arquivos')), const SizedBox(width: 12)]),
       body: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 1050), child: Padding(padding: const EdgeInsets.all(24), child: content))),
     );
   }
