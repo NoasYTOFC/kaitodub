@@ -153,11 +153,12 @@ class _LibraryPageState extends State<LibraryPage> {
           FilledButton.icon(
             onPressed: () async {
               if (Platform.isAndroid && release.apkUrl != null) {
+                Navigator.pop(context);
                 await _downloadAndInstallAndroid(release.apkUrl!, release.version);
               } else {
                 await launchUrl(Uri.parse(release.url), mode: LaunchMode.externalApplication);
+                if (context.mounted) Navigator.pop(context);
               }
-              if (context.mounted) Navigator.pop(context);
             },
             icon: Icon(Platform.isAndroid && release.apkUrl != null ? Icons.download_rounded : Icons.open_in_new_rounded),
             label: Text(Platform.isAndroid && release.apkUrl != null ? 'Instalar Android' : 'Abrir release'),
@@ -169,22 +170,69 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> _downloadAndInstallAndroid(String apkUrl, String version) async {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Baixando atualização...')));
+    var progress = 0.0;
+    var downloadedBytes = 0;
+    var totalBytes = 0;
+    var dialogOpen = true;
+    void Function(VoidCallback)? updateDialog;
+    Future<void> showDownloadDialog() => showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder: (dialogContext) => StatefulBuilder(
+            builder: (context, setDialogState) {
+              updateDialog = setDialogState;
+              return AlertDialog(
+              key: ValueKey('$downloadedBytes-$totalBytes'),
+              title: const Text('Baixando atualização'),
+              content: Column(mainAxisSize: MainAxisSize.min, children: [
+                LinearProgressIndicator(value: totalBytes > 0 ? progress : null),
+                const SizedBox(height: 12),
+                Text(totalBytes > 0 ? '${(progress * 100).round()}%  •  ${_formatBytes(downloadedBytes)} de ${_formatBytes(totalBytes)}' : _formatBytes(downloadedBytes)),
+              ]),
+              );
+            },
+          ),
+        );
+    final dialogFuture = showDownloadDialog();
     try {
       final request = await HttpClient().getUrl(Uri.parse(apkUrl));
       request.headers.set(HttpHeaders.userAgentHeader, 'KaitoDub');
       final response = await request.close();
       if (response.statusCode != HttpStatus.ok) throw const HttpException('Download da atualização falhou.');
+      totalBytes = response.contentLength;
       final directory = await getTemporaryDirectory();
       final apkPath = p.join(directory.path, 'kaitodub-$version.apk');
       final file = File(apkPath);
-      await response.pipe(file.openWrite());
+      final sink = file.openWrite();
+      await for (final chunk in response) {
+        sink.add(chunk);
+        downloadedBytes += chunk.length;
+        progress = totalBytes > 0 ? (downloadedBytes / totalBytes).clamp(0.0, 1.0) : 0;
+        updateDialog?.call(() {});
+      }
+      await sink.close();
+      progress = 1;
+      if (mounted && dialogOpen) {
+        Navigator.of(context, rootNavigator: true).pop();
+        dialogOpen = false;
+      }
+      await dialogFuture;
       final result = await OpenFilex.open(apkPath, type: 'application/vnd.android.package-archive');
       if (!mounted || result.type == ResultType.done) return;
       _message('Não foi possível abrir o instalador: ${result.message}');
     } catch (error) {
+      if (mounted && dialogOpen) {
+        Navigator.of(context, rootNavigator: true).pop();
+        dialogOpen = false;
+      }
       if (mounted) _message('Não foi possível baixar a atualização: $error');
     }
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
   Future<void> _hydrateDurations(Iterable<AudioItem> items, {void Function(double progress)? onProgress}) async {
