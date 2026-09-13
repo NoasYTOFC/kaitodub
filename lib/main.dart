@@ -9,7 +9,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/material.dart';
-import 'package:just_waveform/just_waveform.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -28,26 +27,39 @@ class KaitoDubsApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        debugShowCheckedModeBanner: false,
-        title: 'KaitoDub',
-        theme: ThemeData(
-          brightness: Brightness.dark,
-          colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3D7BFF), brightness: Brightness.dark),
-          scaffoldBackgroundColor: const Color(0xFF08111F),
-          useMaterial3: true,
-        ),
-        home: const LibraryPage(),
-      );
+    debugShowCheckedModeBanner: false,
+    title: 'KaitoDub',
+    theme: ThemeData(
+      brightness: Brightness.dark,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: const Color(0xFF3D7BFF),
+        brightness: Brightness.dark,
+      ),
+      scaffoldBackgroundColor: const Color(0xFF08111F),
+      useMaterial3: true,
+    ),
+    home: const LibraryPage(),
+  );
 }
 
 class AudioItem {
-  AudioItem({required this.id, required this.name, required this.sourcePath, required this.extension, this.durationMs = 0, this.recordingPath, this.confirmed = false});
+  AudioItem({
+    required this.id,
+    required this.name,
+    required this.sourcePath,
+    required this.extension,
+    this.durationMs = 0,
+    this.recordingPath,
+    this.recordingOffsetMs = 0,
+    this.confirmed = false,
+  });
   final String id;
   final String name;
   final String sourcePath;
   final String extension;
   int durationMs;
   String? recordingPath;
+  int recordingOffsetMs;
   bool confirmed;
 }
 
@@ -70,12 +82,17 @@ String formatDuration(int milliseconds) {
   final hours = totalSeconds ~/ 3600;
   final minutes = totalSeconds % 3600 ~/ 60;
   final seconds = totalSeconds % 60;
-  return hours > 0 ? '${hours}h ${minutes.toString().padLeft(2, '0')}min' : '${minutes}min ${seconds.toString().padLeft(2, '0')}s';
+  return hours > 0
+      ? '${hours}h ${minutes.toString().padLeft(2, '0')}min'
+      : '${minutes}min ${seconds.toString().padLeft(2, '0')}s';
 }
 
-int totalDuration(List<AudioItem> items) => items.fold(0, (total, item) => total + item.durationMs);
+int totalDuration(List<AudioItem> items) =>
+    items.fold(0, (total, item) => total + item.durationMs);
 
-int confirmedDuration(List<AudioItem> items) => items.where((item) => item.confirmed).fold(0, (total, item) => total + item.durationMs);
+int confirmedDuration(List<AudioItem> items) => items
+    .where((item) => item.confirmed)
+    .fold(0, (total, item) => total + item.durationMs);
 
 final _store = stringMapStoreFactory.store('sessions');
 final _folderStore = stringMapStoreFactory.store('folders');
@@ -87,33 +104,57 @@ class DubDatabase {
     if (_db != null) return _db!;
     final directory = await getApplicationSupportDirectory();
     await directory.create(recursive: true);
-    _db = await databaseFactoryIo.openDatabase(p.join(directory.path, 'kaito_dubs.db'));
+    _db = await databaseFactoryIo.openDatabase(
+      p.join(directory.path, 'kaito_dubs.db'),
+    );
     return _db!;
   }
 
   DubSession _sessionFromData(String id, Map<String, dynamic> data) {
     final items = (data['items'] as List<dynamic>).map((raw) {
       final value = Map<String, dynamic>.from(raw as Map);
-      return AudioItem(id: value['id'] as String, name: value['name'] as String, sourcePath: value['sourcePath'] as String, extension: value['extension'] as String, durationMs: value['durationMs'] as int? ?? 0, recordingPath: value['recordingPath'] as String?, confirmed: value['confirmed'] as bool? ?? false);
+      return AudioItem(
+        id: value['id'] as String,
+        name: value['name'] as String,
+        sourcePath: value['sourcePath'] as String,
+        extension: value['extension'] as String,
+        durationMs: value['durationMs'] as int? ?? 0,
+        recordingPath: value['recordingPath'] as String?,
+        recordingOffsetMs: value['recordingOffsetMs'] as int? ?? 0,
+        confirmed: value['confirmed'] as bool? ?? false,
+      );
     }).toList();
     return DubSession(id: id, name: data['name'] as String, items: items);
   }
 
   Future<List<DubFolder>> loadFolders() async {
     final db = await database;
-    final folders = await _folderStore.find(db, finder: Finder(sortOrders: [SortOrder('createdAt', false)]));
+    final folders = await _folderStore.find(
+      db,
+      finder: Finder(sortOrders: [SortOrder('createdAt', false)]),
+    );
     final result = folders.map((record) {
       final data = record.value;
       final sessions = (data['sessions'] as List<dynamic>).map((raw) {
         final value = Map<String, dynamic>.from(raw as Map);
         return _sessionFromData(value['id'] as String, value);
       }).toList();
-      return DubFolder(id: record.key, name: data['name'] as String, sessions: sessions);
+      return DubFolder(
+        id: record.key,
+        name: data['name'] as String,
+        sessions: sessions,
+      );
     }).toList();
     if (result.isNotEmpty) return result;
-    final legacy = await _store.find(db, finder: Finder(sortOrders: [SortOrder('createdAt', false)]));
+    final legacy = await _store.find(
+      db,
+      finder: Finder(sortOrders: [SortOrder('createdAt', false)]),
+    );
     return legacy.map((record) {
-      final session = _sessionFromData(record.key, Map<String, dynamic>.from(record.value));
+      final session = _sessionFromData(
+        record.key,
+        Map<String, dynamic>.from(record.value),
+      );
       return DubFolder(id: session.id, name: session.name, sessions: [session]);
     }).toList();
   }
@@ -123,10 +164,23 @@ class DubDatabase {
   }
 
   Map<String, dynamic> _sessionData(DubSession session) => {
-      'name': session.name,
-      'id': session.id,
-      'items': session.items.map((item) => {'id': item.id, 'name': item.name, 'sourcePath': item.sourcePath, 'extension': item.extension, 'durationMs': item.durationMs, 'recordingPath': item.recordingPath, 'confirmed': item.confirmed}).toList(),
-    };
+    'name': session.name,
+    'id': session.id,
+    'items': session.items
+        .map(
+          (item) => {
+            'id': item.id,
+            'name': item.name,
+            'sourcePath': item.sourcePath,
+            'extension': item.extension,
+            'durationMs': item.durationMs,
+            'recordingPath': item.recordingPath,
+            'recordingOffsetMs': item.recordingOffsetMs,
+            'confirmed': item.confirmed,
+          },
+        )
+        .toList(),
+  };
 
   Future<void> saveFolder(DubFolder folder) async {
     await _folderStore.record(folder.id).put(await database, {
@@ -144,11 +198,14 @@ class DubDatabase {
     await _folderStore.record(folderId).delete(await database);
   }
 
-  Future<List<DubSession>> load() async => (await loadFolders()).expand((folder) => folder.sessions).toList();
+  Future<List<DubSession>> load() async =>
+      (await loadFolders()).expand((folder) => folder.sessions).toList();
 
   Future<void> updateSession(DubSession session) async {
     final folders = await loadFolders();
-    final folder = folders.firstWhere((folder) => folder.sessions.any((saved) => saved.id == session.id));
+    final folder = folders.firstWhere(
+      (folder) => folder.sessions.any((saved) => saved.id == session.id),
+    );
     final index = folder.sessions.indexWhere((saved) => saved.id == session.id);
     folder.sessions[index] = session;
     await saveFolder(folder);
@@ -176,41 +233,78 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   Future<void> _load() async {
-    setState(() { _busy = true; _busyProgress = null; _busyMessage = 'Carregando sessões...'; });
+    setState(() {
+      _busy = true;
+      _busyProgress = null;
+      _busyMessage = 'Carregando sessões...';
+    });
     _folders = await _database.loadFolders();
-    _folders.sort((first, second) => _folderItemCount(second).compareTo(_folderItemCount(first)));
-    await _hydrateDurations(_folders.expand((folder) => folder.sessions).expand((session) => session.items));
+    _folders.sort(
+      (first, second) =>
+          _folderItemCount(second).compareTo(_folderItemCount(first)),
+    );
+    await _hydrateDurations(
+      _folders
+          .expand((folder) => folder.sessions)
+          .expand((session) => session.items),
+    );
     if (mounted) setState(() => _busy = false);
     await _checkForUpdate();
   }
 
-  int _folderItemCount(DubFolder folder) => folder.sessions.fold(0, (total, session) => total + session.items.length);
+  int _folderItemCount(DubFolder folder) =>
+      folder.sessions.fold(0, (total, session) => total + session.items.length);
 
   Future<void> _checkForUpdate() async {
     if (_updateCheckCompleted) return;
     _updateCheckCompleted = true;
     final packageInfo = await PackageInfo.fromPlatform();
-    final release = await const GithubReleaseService().latestRelease(owner: 'NoasYTOFC', repository: 'kaitodub');
-    if (!mounted || release == null || !isNewerVersion(release.version, packageInfo.version)) return;
+    final release = await const GithubReleaseService().latestRelease(
+      owner: 'NoasYTOFC',
+      repository: 'kaitodub',
+    );
+    if (!mounted ||
+        release == null ||
+        !isNewerVersion(release.version, packageInfo.version))
+      return;
     await showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Nova versão disponível'),
-        content: Text('${release.name}\n\nVersão instalada: ${packageInfo.version}\nNova versão: ${release.version}'),
+        content: Text(
+          '${release.name}\n\nVersão instalada: ${packageInfo.version}\nNova versão: ${release.version}',
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Depois')),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Depois'),
+          ),
           FilledButton.icon(
             onPressed: () async {
               if (Platform.isAndroid && release.apkUrl != null) {
                 Navigator.pop(context);
-                await _downloadAndInstallAndroid(release.apkUrl!, release.version);
+                await _downloadAndInstallAndroid(
+                  release.apkUrl!,
+                  release.version,
+                );
               } else {
-                await launchUrl(Uri.parse(release.url), mode: LaunchMode.externalApplication);
+                await launchUrl(
+                  Uri.parse(release.url),
+                  mode: LaunchMode.externalApplication,
+                );
                 if (context.mounted) Navigator.pop(context);
               }
             },
-            icon: Icon(Platform.isAndroid && release.apkUrl != null ? Icons.download_rounded : Icons.open_in_new_rounded),
-            label: Text(Platform.isAndroid && release.apkUrl != null ? 'Instalar Android' : 'Abrir release'),
+            icon: Icon(
+              Platform.isAndroid && release.apkUrl != null
+                  ? Icons.download_rounded
+                  : Icons.open_in_new_rounded,
+            ),
+            label: Text(
+              Platform.isAndroid && release.apkUrl != null
+                  ? 'Instalar Android'
+                  : 'Abrir release',
+            ),
           ),
         ],
       ),
@@ -225,29 +319,39 @@ class _LibraryPageState extends State<LibraryPage> {
     var dialogOpen = true;
     void Function(VoidCallback)? updateDialog;
     Future<void> showDownloadDialog() => showDialog<void>(
-          context: context,
-          barrierDismissible: false,
-          builder: (dialogContext) => StatefulBuilder(
-            builder: (context, setDialogState) {
-              updateDialog = setDialogState;
-              return AlertDialog(
-              key: ValueKey('$downloadedBytes-$totalBytes'),
-              title: const Text('Baixando atualização'),
-              content: Column(mainAxisSize: MainAxisSize.min, children: [
-                LinearProgressIndicator(value: totalBytes > 0 ? progress : null),
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          updateDialog = setDialogState;
+          return AlertDialog(
+            key: ValueKey('$downloadedBytes-$totalBytes'),
+            title: const Text('Baixando atualização'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                LinearProgressIndicator(
+                  value: totalBytes > 0 ? progress : null,
+                ),
                 const SizedBox(height: 12),
-                Text(totalBytes > 0 ? '${(progress * 100).round()}%  •  ${_formatBytes(downloadedBytes)} de ${_formatBytes(totalBytes)}' : _formatBytes(downloadedBytes)),
-              ]),
-              );
-            },
-          ),
-        );
+                Text(
+                  totalBytes > 0
+                      ? '${(progress * 100).round()}%  •  ${_formatBytes(downloadedBytes)} de ${_formatBytes(totalBytes)}'
+                      : _formatBytes(downloadedBytes),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
     final dialogFuture = showDownloadDialog();
     try {
       final request = await HttpClient().getUrl(Uri.parse(apkUrl));
       request.headers.set(HttpHeaders.userAgentHeader, 'KaitoDub');
       final response = await request.close();
-      if (response.statusCode != HttpStatus.ok) throw const HttpException('Download da atualização falhou.');
+      if (response.statusCode != HttpStatus.ok)
+        throw const HttpException('Download da atualização falhou.');
       totalBytes = response.contentLength;
       final directory = await getTemporaryDirectory();
       final apkPath = p.join(directory.path, 'kaitodub-$version.apk');
@@ -256,7 +360,9 @@ class _LibraryPageState extends State<LibraryPage> {
       await for (final chunk in response) {
         sink.add(chunk);
         downloadedBytes += chunk.length;
-        progress = totalBytes > 0 ? (downloadedBytes / totalBytes).clamp(0.0, 1.0) : 0;
+        progress = totalBytes > 0
+            ? (downloadedBytes / totalBytes).clamp(0.0, 1.0)
+            : 0;
         updateDialog?.call(() {});
       }
       await sink.close();
@@ -266,7 +372,10 @@ class _LibraryPageState extends State<LibraryPage> {
         dialogOpen = false;
       }
       await dialogFuture;
-      final result = await OpenFilex.open(apkPath, type: 'application/vnd.android.package-archive');
+      final result = await OpenFilex.open(
+        apkPath,
+        type: 'application/vnd.android.package-archive',
+      );
       if (!mounted || result.type == ResultType.done) return;
       _message('Não foi possível abrir o instalador: ${result.message}');
     } catch (error) {
@@ -284,7 +393,10 @@ class _LibraryPageState extends State<LibraryPage> {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
-  Future<void> _hydrateDurations(Iterable<AudioItem> items, {void Function(double progress)? onProgress}) async {
+  Future<void> _hydrateDurations(
+    Iterable<AudioItem> items, {
+    void Function(double progress)? onProgress,
+  }) async {
     final player = AudioPlayer();
     try {
       final pendingItems = items.where((item) => item.durationMs <= 0).toList();
@@ -308,33 +420,70 @@ class _LibraryPageState extends State<LibraryPage> {
     return showDialog<String>(
       context: context,
       barrierDismissible: false,
-      builder: (context) => StatefulBuilder(builder: (context, setDialogState) {
-        final canCreate = controller.text.trim().isNotEmpty;
-        return AlertDialog(
-          title: const Text('Criar pasta'),
-          content: TextField(
-            controller: controller,
-            autofocus: true,
-            decoration: const InputDecoration(labelText: 'Nome da pasta', hintText: 'Ex.: Personagem 01'),
-            onChanged: (_) => setDialogState(() {}),
-            onSubmitted: canCreate ? (_) => Navigator.pop(context, controller.text.trim()) : null,
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar')),
-            FilledButton(onPressed: canCreate ? () => Navigator.pop(context, controller.text.trim()) : null, child: const Text('Criar pasta')),
-          ],
-        );
-      }),
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          final canCreate = controller.text.trim().isNotEmpty;
+          return AlertDialog(
+            title: const Text('Criar pasta'),
+            content: TextField(
+              controller: controller,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Nome da pasta',
+                hintText: 'Ex.: Personagem 01',
+              ),
+              onChanged: (_) => setDialogState(() {}),
+              onSubmitted: canCreate
+                  ? (_) => Navigator.pop(context, controller.text.trim())
+                  : null,
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancelar'),
+              ),
+              FilledButton(
+                onPressed: canCreate
+                    ? () => Navigator.pop(context, controller.text.trim())
+                    : null,
+                child: const Text('Criar pasta'),
+              ),
+            ],
+          );
+        },
+      ),
     );
   }
 
   Future<void> _import() async {
-    const audioExtensions = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus', '.wma'};
-    final result = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: [...audioExtensions.map((extension) => extension.substring(1)), 'zip', 'rar'], allowMultiple: true, withData: true);
+    const audioExtensions = {
+      '.mp3',
+      '.wav',
+      '.m4a',
+      '.aac',
+      '.ogg',
+      '.flac',
+      '.opus',
+      '.wma',
+    };
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: [
+        ...audioExtensions.map((extension) => extension.substring(1)),
+        'zip',
+        'rar',
+      ],
+      allowMultiple: true,
+      withData: true,
+    );
     if (result == null || result.files.isEmpty) return;
     final folderName = await _askFolderName();
     if (folderName == null || folderName.isEmpty) return;
-    setState(() { _busy = true; _busyProgress = 0; _busyMessage = 'Extraindo áudios...'; });
+    setState(() {
+      _busy = true;
+      _busyProgress = 0;
+      _busyMessage = 'Extraindo áudios...';
+    });
     try {
       final root = await getApplicationSupportDirectory();
       final folderId = DateTime.now().microsecondsSinceEpoch.toString();
@@ -346,47 +495,105 @@ class _LibraryPageState extends State<LibraryPage> {
         final selectedFile = result.files[fileIndex];
         final extension = p.extension(selectedFile.name).toLowerCase();
         if (extension == '.rar') {
-          _message('RAR foi ignorado porque a extração ainda não está disponível.');
+          _message(
+            'RAR foi ignorado porque a extração ainda não está disponível.',
+          );
           continue;
         }
         if (extension == '.zip') {
           final bytes = selectedFile.bytes;
           if (bytes == null) continue;
           final archive = ZipDecoder().decodeBytes(bytes);
-          final audioEntries = archive.files.where((entry) => entry.isFile && audioExtensions.contains(p.extension(entry.name).toLowerCase())).toList();
+          final audioEntries = archive.files
+              .where(
+                (entry) =>
+                    entry.isFile &&
+                    audioExtensions.contains(
+                      p.extension(entry.name).toLowerCase(),
+                    ),
+              )
+              .toList();
           final sessionId = '$folderId-$fileIndex';
           final sessionFolder = Directory(p.join(folder.path, sessionId));
           await sessionFolder.create(recursive: true);
           final items = <AudioItem>[];
           for (final entry in audioEntries) {
             final entryExtension = p.extension(entry.name).toLowerCase();
-            final path = p.join(sessionFolder.path, '${items.length}$entryExtension');
+            final path = p.join(
+              sessionFolder.path,
+              '${items.length}$entryExtension',
+            );
             await File(path).writeAsBytes(entry.content as List<int>);
-            items.add(AudioItem(id: '$sessionId-${items.length}', name: p.basenameWithoutExtension(entry.name), sourcePath: path, extension: entryExtension));
+            items.add(
+              AudioItem(
+                id: '$sessionId-${items.length}',
+                name: p.basenameWithoutExtension(entry.name),
+                sourcePath: path,
+                extension: entryExtension,
+              ),
+            );
           }
-          if (items.isNotEmpty) sessions.add(DubSession(id: sessionId, name: p.basenameWithoutExtension(selectedFile.name), items: items));
+          if (items.isNotEmpty)
+            sessions.add(
+              DubSession(
+                id: sessionId,
+                name: p.basenameWithoutExtension(selectedFile.name),
+                items: items,
+              ),
+            );
         } else if (audioExtensions.contains(extension)) {
-          final bytes = selectedFile.bytes ?? (selectedFile.path == null ? null : await File(selectedFile.path!).readAsBytes());
+          final bytes =
+              selectedFile.bytes ??
+              (selectedFile.path == null
+                  ? null
+                  : await File(selectedFile.path!).readAsBytes());
           if (bytes == null) continue;
           final sessionId = '$folderId-$fileIndex';
           final sessionFolder = Directory(p.join(folder.path, sessionId));
           await sessionFolder.create(recursive: true);
           final path = p.join(sessionFolder.path, '0$extension');
           await File(path).writeAsBytes(bytes);
-          sessions.add(DubSession(id: sessionId, name: p.basenameWithoutExtension(selectedFile.name), items: [AudioItem(id: '$sessionId-0', name: p.basenameWithoutExtension(selectedFile.name), sourcePath: path, extension: extension)]));
+          sessions.add(
+            DubSession(
+              id: sessionId,
+              name: p.basenameWithoutExtension(selectedFile.name),
+              items: [
+                AudioItem(
+                  id: '$sessionId-0',
+                  name: p.basenameWithoutExtension(selectedFile.name),
+                  sourcePath: path,
+                  extension: extension,
+                ),
+              ],
+            ),
+          );
         }
-        if (mounted) setState(() => _busyProgress = (fileIndex + 1) / totalFiles * .5);
+        if (mounted)
+          setState(() => _busyProgress = (fileIndex + 1) / totalFiles * .5);
       }
       if (sessions.isEmpty) throw const FormatException();
-      if (mounted) setState(() { _busyMessage = 'Lendo durações dos áudios...'; _busyProgress = .5; });
-      await _hydrateDurations(sessions.expand((session) => session.items), onProgress: (progress) {
-        if (mounted) setState(() => _busyProgress = .5 + progress * .45);
-      });
-      await _database.saveFolder(DubFolder(id: folderId, name: folderName, sessions: sessions));
+      if (mounted)
+        setState(() {
+          _busyMessage = 'Lendo durações dos áudios...';
+          _busyProgress = .5;
+        });
+      await _hydrateDurations(
+        sessions.expand((session) => session.items),
+        onProgress: (progress) {
+          if (mounted) setState(() => _busyProgress = .5 + progress * .45);
+        },
+      );
+      await _database.saveFolder(
+        DubFolder(id: folderId, name: folderName, sessions: sessions),
+      );
       await _load();
     } catch (_) {
       _message('Não foi possível importar este ZIP ou ele não contém áudio.');
-      if (mounted) setState(() { _busy = false; _busyProgress = null; });
+      if (mounted)
+        setState(() {
+          _busy = false;
+          _busyProgress = null;
+        });
     }
   }
 
@@ -395,90 +602,206 @@ class _LibraryPageState extends State<LibraryPage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Excluir pasta?'),
-        content: Text('A pasta "${folderData.name}" e todos os seus arquivos serão removidos do aplicativo.'),
+        content: Text(
+          'A pasta "${folderData.name}" e todos os seus arquivos serão removidos do aplicativo.',
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Excluir')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Excluir'),
+          ),
         ],
       ),
     );
     if (accepted != true) return;
     await _database.deleteFolder(folderData.id);
-    final folder = Directory(p.join((await getApplicationSupportDirectory()).path, 'sessions', folderData.id));
+    final folder = Directory(
+      p.join(
+        (await getApplicationSupportDirectory()).path,
+        'sessions',
+        folderData.id,
+      ),
+    );
     if (await folder.exists()) await folder.delete(recursive: true);
     await _load();
   }
 
   void _message(String text) {
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    if (mounted)
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   @override
   Widget build(BuildContext context) {
     Widget content;
     if (_busy) {
-      content = Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-        SizedBox(width: 320, child: LinearProgressIndicator(value: _busyProgress)),
-        const SizedBox(height: 12),
-        Text(_busyMessage, style: const TextStyle(color: Colors.white70)),
-        if (_busyProgress != null) ...[const SizedBox(height: 6), Text('${(_busyProgress! * 100).round()}%', style: const TextStyle(color: Colors.white54))],
-      ]));
+      content = Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 320,
+              child: LinearProgressIndicator(value: _busyProgress),
+            ),
+            const SizedBox(height: 12),
+            Text(_busyMessage, style: const TextStyle(color: Colors.white70)),
+            if (_busyProgress != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                '${(_busyProgress! * 100).round()}%',
+                style: const TextStyle(color: Colors.white54),
+              ),
+            ],
+          ],
+        ),
+      );
     } else if (_folders.isEmpty) {
-      content = Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-        const Text('Importe seus áudios para criar sua primeira pasta.', style: TextStyle(color: Colors.white54)),
-        const SizedBox(height: 16),
-        FilledButton.icon(onPressed: _busy ? null : _import, icon: const Icon(Icons.file_upload_outlined), label: const Text('Importar arquivos')),
-      ]));
+      content = Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text(
+              'Importe seus áudios para criar sua primeira pasta.',
+              style: TextStyle(color: Colors.white54),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _busy ? null : _import,
+              icon: const Icon(Icons.file_upload_outlined),
+              label: const Text('Importar arquivos'),
+            ),
+          ],
+        ),
+      );
     } else {
-      content = ListView(children: [
-        const Text('Pastas de dublagem', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w700)),
-        const SizedBox(height: 8),
-        const Text('Cada pasta mantém seus áudios salvos no aplicativo até ser exportada.', style: TextStyle(color: Colors.white54)),
-        const SizedBox(height: 24),
-        _libraryTotalSummary(),
-        const SizedBox(height: 10),
-        ..._folders.map((folderData) {
-          final sessions = folderData.sessions;
-          final items = sessions.expand((session) => session.items).toList();
-          final total = totalDuration(items);
-          final confirmed = items.where((item) => item.confirmed).length;
-          final progress = total == 0 ? 0.0 : (confirmedDuration(items) / total).clamp(0.0, 1.0);
-          return Card(child: ListTile(
-              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => FolderPage(folder: folderData, database: _database, onChanged: _load))),
-              leading: Icon(Icons.folder_zip_outlined, color: Theme.of(context).colorScheme.primary),
-              title: Text(folderData.name),
-              subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                const SizedBox(height: 4),
-                Text('${sessions.length} arquivo(s)  •  $confirmed de ${items.length} áudios confirmados'),
-                Text('Tempo total: ${formatDuration(total)}', style: const TextStyle(color: Colors.white60)),
-                const SizedBox(height: 6),
-                LinearProgressIndicator(value: progress),
-              ]),
-              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                IconButton(onPressed: _busy ? null : () => _deleteFolder(folderData), tooltip: 'Excluir pasta', icon: const Icon(Icons.delete_outline_rounded)),
-                const Icon(Icons.chevron_right_rounded),
-              ]),
-            ));
-        })
-      ]);
+      content = ListView(
+        children: [
+          const Text(
+            'Pastas de dublagem',
+            style: TextStyle(fontSize: 26, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Cada pasta mantém seus áudios salvos no aplicativo até ser exportada.',
+            style: TextStyle(color: Colors.white54),
+          ),
+          const SizedBox(height: 24),
+          _libraryTotalSummary(),
+          const SizedBox(height: 10),
+          ..._folders.map((folderData) {
+            final sessions = folderData.sessions;
+            final items = sessions.expand((session) => session.items).toList();
+            final total = totalDuration(items);
+            final confirmed = items.where((item) => item.confirmed).length;
+            final progress = total == 0
+                ? 0.0
+                : (confirmedDuration(items) / total).clamp(0.0, 1.0);
+            return Card(
+              child: ListTile(
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => FolderPage(
+                      folder: folderData,
+                      database: _database,
+                      onChanged: _load,
+                    ),
+                  ),
+                ),
+                leading: Icon(
+                  Icons.folder_zip_outlined,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
+                title: Text(folderData.name),
+                subtitle: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const SizedBox(height: 4),
+                    Text(
+                      '${sessions.length} arquivo(s)  •  $confirmed de ${items.length} áudios confirmados',
+                    ),
+                    Text(
+                      'Tempo total: ${formatDuration(total)}',
+                      style: const TextStyle(color: Colors.white60),
+                    ),
+                    const SizedBox(height: 6),
+                    LinearProgressIndicator(value: progress),
+                  ],
+                ),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      onPressed: _busy ? null : () => _deleteFolder(folderData),
+                      tooltip: 'Excluir pasta',
+                      icon: const Icon(Icons.delete_outline_rounded),
+                    ),
+                    const Icon(Icons.chevron_right_rounded),
+                  ],
+                ),
+              ),
+            );
+          }),
+        ],
+      );
     }
     return Scaffold(
-      appBar: AppBar(title: const Text('KaitoDub', style: TextStyle(fontWeight: FontWeight.w800)), actions: [FilledButton.icon(onPressed: _busy ? null : _import, icon: const Icon(Icons.file_upload_outlined), label: const Text('Importar arquivos')), const SizedBox(width: 12)]),
-      body: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 1050), child: Padding(padding: const EdgeInsets.all(24), child: content))),
+      appBar: AppBar(
+        title: const Text(
+          'KaitoDub',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+        actions: [
+          FilledButton.icon(
+            onPressed: _busy ? null : _import,
+            icon: const Icon(Icons.file_upload_outlined),
+            label: const Text('Importar arquivos'),
+          ),
+          const SizedBox(width: 12),
+        ],
+      ),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 1050),
+          child: Padding(padding: const EdgeInsets.all(24), child: content),
+        ),
+      ),
     );
   }
 
   Widget _libraryTotalSummary() {
-    final items = _folders.expand((folder) => folder.sessions).expand((session) => session.items).toList();
+    final items = _folders
+        .expand((folder) => folder.sessions)
+        .expand((session) => session.items)
+        .toList();
     final total = totalDuration(items);
-    return Padding(padding: const EdgeInsets.only(bottom: 14), child: Row(children: [
-      Expanded(child: Text('Tempo total em dublagem: ${formatDuration(total)}', style: const TextStyle(fontWeight: FontWeight.w700))),
-    ]));
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              'Tempo total em dublagem: ${formatDuration(total)}',
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
 class FolderPage extends StatefulWidget {
-  const FolderPage({required this.folder, required this.database, required this.onChanged, super.key});
+  const FolderPage({
+    required this.folder,
+    required this.database,
+    required this.onChanged,
+    super.key,
+  });
   final DubFolder folder;
   final DubDatabase database;
   final VoidCallback onChanged;
@@ -490,35 +813,66 @@ class FolderPage extends StatefulWidget {
 class _FolderPageState extends State<FolderPage> {
   @override
   Widget build(BuildContext context) {
-    final items = widget.folder.sessions.expand((session) => session.items).toList();
+    final items = widget.folder.sessions
+        .expand((session) => session.items)
+        .toList();
     final total = totalDuration(items);
     final confirmed = items.where((item) => item.confirmed).length;
-    final progress = total == 0 ? 0.0 : (confirmedDuration(items) / total).clamp(0.0, 1.0);
+    final progress = total == 0
+        ? 0.0
+        : (confirmedDuration(items) / total).clamp(0.0, 1.0);
     return Scaffold(
       appBar: AppBar(title: Text(widget.folder.name)),
-      body: ListView(padding: const EdgeInsets.all(24), children: [
-        Text('$confirmed de ${items.length} áudios confirmados'),
-        const SizedBox(height: 6),
-        Text('Tempo total: ${formatDuration(total)}', style: const TextStyle(color: Colors.white60)),
-        const SizedBox(height: 8),
-        LinearProgressIndicator(value: progress),
-        const SizedBox(height: 24),
-        ...widget.folder.sessions.map((session) => Card(
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          Text('$confirmed de ${items.length} áudios confirmados'),
+          const SizedBox(height: 6),
+          Text(
+            'Tempo total: ${formatDuration(total)}',
+            style: const TextStyle(color: Colors.white60),
+          ),
+          const SizedBox(height: 8),
+          LinearProgressIndicator(value: progress),
+          const SizedBox(height: 24),
+          ...widget.folder.sessions.map(
+            (session) => Card(
               child: ListTile(
                 leading: const Icon(Icons.insert_drive_file_outlined),
                 title: Text(session.name),
-                subtitle: Text('${session.items.length} áudio(s)  •  ${session.items.where((item) => item.confirmed).length} confirmados'),
+                subtitle: Text(
+                  '${session.items.length} áudio(s)  •  ${session.items.where((item) => item.confirmed).length} confirmados',
+                ),
                 trailing: const Icon(Icons.chevron_right_rounded),
-                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SessionPage(session: session, database: widget.database, onChanged: () { widget.onChanged(); setState(() {}); }))),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => SessionPage(
+                      session: session,
+                      database: widget.database,
+                      onChanged: () {
+                        widget.onChanged();
+                        setState(() {});
+                      },
+                    ),
+                  ),
+                ),
               ),
-            )),
-      ]),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
 
 class SessionPage extends StatefulWidget {
-  const SessionPage({required this.session, required this.database, required this.onChanged, super.key});
+  const SessionPage({
+    required this.session,
+    required this.database,
+    required this.onChanged,
+    super.key,
+  });
   final DubSession session;
   final DubDatabase database;
   final VoidCallback onChanged;
@@ -538,28 +892,91 @@ class _SessionPageState extends State<SessionPage> {
     super.dispose();
   }
 
+  Future<String> _alignedExportPath(AudioItem item) async {
+    final source = item.recordingPath!;
+    if (item.recordingOffsetMs == 0) return source;
+    final directory = await getTemporaryDirectory();
+    final output = p.join(directory.path, '${item.id}-aligned.wav');
+    final target = (max(1, item.durationMs) / 1000).toStringAsFixed(3);
+    final offset = item.recordingOffsetMs;
+    final filter = offset >= 0
+        ? 'adelay=$offset|$offset,apad,atrim=duration=$target'
+        : 'atrim=start=${-offset / 1000},asetpts=PTS-STARTPTS,apad,atrim=duration=$target';
+    final session = await FFmpegKit.execute(
+      '-y -i "$source" -ac 1 -ar 44100 -c:a pcm_s16le -af "$filter" "$output"',
+    );
+    final code = await session.getReturnCode();
+    if (code == null || !ReturnCode.isSuccess(code) || !await File(output).exists()) return source;
+    return output;
+  }
+
   Future<void> _export() async {
     if (_exporting) return;
-    final missing = widget.session.items.where((item) => !item.confirmed).length;
+    final missing = widget.session.items
+        .where((item) => !item.confirmed)
+        .length;
     if (missing > 0) {
-      final accepted = await showDialog<bool>(context: context, builder: (context) => AlertDialog(title: const Text('Há dublagens pendentes'), content: Text('$missing áudio(s) ainda não foram confirmados. Exportar mesmo assim?'), actions: [TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')), FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Exportar'))]));
+      final accepted = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Há dublagens pendentes'),
+          content: Text(
+            '$missing áudio(s) ainda não foram confirmados. Exportar mesmo assim?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Exportar'),
+            ),
+          ],
+        ),
+      );
       if (accepted != true) return;
     }
-    setState(() { _exporting = true; _exportProgress = 0; _exportMessage = 'Preparando exportação...'; });
+    setState(() {
+      _exporting = true;
+      _exportProgress = 0;
+      _exportMessage = 'Preparando exportação...';
+    });
     try {
       final archive = Archive();
       final items = widget.session.items;
       for (var index = 0; index < items.length; index++) {
         final item = items[index];
-        final source = item.confirmed && item.recordingPath != null ? item.recordingPath! : item.sourcePath;
-        final data = await File(source).readAsBytes();
-        final fileName = item.confirmed ? '${item.name}_dubbed.wav' : '${item.name}${item.extension}';
+        final source = item.confirmed && item.recordingPath != null
+            ? item.recordingPath!
+            : item.sourcePath;
+        final alignedSource = item.confirmed && item.recordingPath != null
+          ? await _alignedExportPath(item)
+          : source;
+        final data = await File(alignedSource).readAsBytes();
+        if (alignedSource != source) await File(alignedSource).delete();
+        final fileName = item.confirmed
+            ? '${item.name}_dubbed.wav'
+            : '${item.name}${item.extension}';
         archive.addFile(ArchiveFile(fileName, data.length, data));
-        if (mounted) setState(() { _exportProgress = (index + 1) / items.length * .7; _exportMessage = 'Compactando áudio ${index + 1} de ${items.length}...'; });
+        if (mounted)
+          setState(() {
+            _exportProgress = (index + 1) / items.length * .7;
+            _exportMessage =
+                'Compactando áudio ${index + 1} de ${items.length}...';
+          });
       }
-      if (mounted) setState(() { _exportProgress = .8; _exportMessage = 'Gerando arquivo ZIP...'; });
+      if (mounted)
+        setState(() {
+          _exportProgress = .8;
+          _exportMessage = 'Gerando arquivo ZIP...';
+        });
       final encoded = Uint8List.fromList(ZipEncoder().encode(archive));
-      if (mounted) setState(() { _exportProgress = .9; _exportMessage = 'Salvando exportação...'; });
+      if (mounted)
+        setState(() {
+          _exportProgress = .9;
+          _exportMessage = 'Salvando exportação...';
+        });
       final output = await FilePicker.platform.saveFile(
         dialogTitle: 'Escolha onde salvar a exportação',
         fileName: 'exported_${widget.session.name}.zip',
@@ -569,8 +986,13 @@ class _SessionPageState extends State<SessionPage> {
       );
       if (output == null) return;
       if (mounted) {
-        setState(() { _exportProgress = 1; _exportMessage = 'Exportação concluída'; });
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Exportado para $output')));
+        setState(() {
+          _exportProgress = 1;
+          _exportMessage = 'Exportação concluída';
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Exportado para $output')));
       }
     } catch (error) {
       if (mounted) _message('Não foi possível exportar os áudios: $error');
@@ -580,7 +1002,8 @@ class _SessionPageState extends State<SessionPage> {
   }
 
   void _message(String text) {
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    if (mounted)
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   Widget _sessionSummary() {
@@ -588,60 +1011,189 @@ class _SessionPageState extends State<SessionPage> {
     final done = confirmedDuration(widget.session.items);
     final remaining = max(0, total - done);
     final progress = total == 0 ? 0.0 : (done / total).clamp(0.0, 1.0);
-    return Padding(padding: const EdgeInsets.fromLTRB(24, 16, 24, 6), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(children: [
-        Expanded(child: Text('Total ${formatDuration(total)}', style: const TextStyle(fontWeight: FontWeight.w700))),
-        Text('${(progress * 100).round()}%', style: TextStyle(color: Theme.of(context).colorScheme.primary, fontWeight: FontWeight.w800)),
-      ]),
-      const SizedBox(height: 8),
-      LinearProgressIndicator(value: progress),
-      const SizedBox(height: 6),
-      Text('Dublado ${formatDuration(done)}  •  Falta ${formatDuration(remaining)}', style: const TextStyle(color: Colors.white60, fontSize: 12)),
-    ]));
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 16, 24, 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Total ${formatDuration(total)}',
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+              Text(
+                '${(progress * 100).round()}%',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.primary,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          LinearProgressIndicator(value: progress),
+          const SizedBox(height: 6),
+          Text(
+            'Dublado ${formatDuration(done)}  •  Falta ${formatDuration(remaining)}',
+            style: const TextStyle(color: Colors.white60, fontSize: 12),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: Text(widget.session.name), actions: [IconButton(onPressed: _exporting ? null : _export, tooltip: 'Exportar', icon: const Icon(Icons.ios_share_rounded))]),
-        body: Column(children: [
-          if (_exporting) Padding(padding: const EdgeInsets.fromLTRB(24, 12, 24, 0), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [Expanded(child: Text(_exportMessage, style: const TextStyle(color: Colors.white70))), Text('${(_exportProgress * 100).round()}%')]),
-            const SizedBox(height: 8),
-            LinearProgressIndicator(value: _exportProgress),
-          ])),
-          _sessionSummary(), Expanded(child: LayoutBuilder(builder: (context, constraints) {
-          final columns = constraints.maxWidth >= 900 ? 5 : constraints.maxWidth >= 600 ? 4 : constraints.maxWidth >= 380 ? 3 : 2;
-          final cardWidth = (constraints.maxWidth - (columns - 1) * 14) / columns;
-          return GridView.builder(
-            padding: const EdgeInsets.all(24),
-            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: columns, crossAxisSpacing: 14, mainAxisSpacing: 14, mainAxisExtent: max(210.0, cardWidth * 1.2)),
-            itemCount: widget.session.items.length,
-            itemBuilder: (context, index) {
-              final item = widget.session.items[index];
-              return Card(child: InkWell(
-                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AudioPage(item: item, database: widget.database, onChanged: () { widget.onChanged(); setState(() {}); }))),
-                borderRadius: BorderRadius.circular(12),
-                child: Padding(padding: const EdgeInsets.all(14), child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                  Align(alignment: Alignment.topRight, child: Icon(item.confirmed ? Icons.check_circle_rounded : Icons.cancel_rounded, color: item.confirmed ? Colors.greenAccent : Colors.redAccent, size: 22)),
-                  const Spacer(),
-                  Icon(Icons.volume_up_rounded, color: Theme.of(context).colorScheme.primary, size: 42),
-                  const SizedBox(height: 12),
-                  Text(item.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 8),
-                  FittedBox(fit: BoxFit.scaleDown, child: Text(formatDuration(item.durationMs), maxLines: 1, style: const TextStyle(color: Colors.white60, fontSize: 12))),
-                  const SizedBox(height: 8),
-                  LinearProgressIndicator(value: item.confirmed ? 1 : 0, minHeight: 4),
-                  const Spacer(),
-                ])),
-              ));
+    appBar: AppBar(
+      title: Text(widget.session.name),
+      actions: [
+        IconButton(
+          onPressed: _exporting ? null : _export,
+          tooltip: 'Exportar',
+          icon: const Icon(Icons.ios_share_rounded),
+        ),
+      ],
+    ),
+    body: Column(
+      children: [
+        if (_exporting)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _exportMessage,
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                    ),
+                    Text('${(_exportProgress * 100).round()}%'),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                LinearProgressIndicator(value: _exportProgress),
+              ],
+            ),
+          ),
+        _sessionSummary(),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final columns = constraints.maxWidth >= 900
+                  ? 5
+                  : constraints.maxWidth >= 600
+                  ? 4
+                  : constraints.maxWidth >= 380
+                  ? 3
+                  : 2;
+              final cardWidth =
+                  (constraints.maxWidth - (columns - 1) * 14) / columns;
+              return GridView.builder(
+                padding: const EdgeInsets.all(24),
+                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: columns,
+                  crossAxisSpacing: 14,
+                  mainAxisSpacing: 14,
+                  mainAxisExtent: max(210.0, cardWidth * 1.2),
+                ),
+                itemCount: widget.session.items.length,
+                itemBuilder: (context, index) {
+                  final item = widget.session.items[index];
+                  return Card(
+                    child: InkWell(
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => AudioPage(
+                            item: item,
+                            database: widget.database,
+                            onChanged: () {
+                              widget.onChanged();
+                              setState(() {});
+                            },
+                          ),
+                        ),
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Align(
+                              alignment: Alignment.topRight,
+                              child: Icon(
+                                item.confirmed
+                                    ? Icons.check_circle_rounded
+                                    : Icons.cancel_rounded,
+                                color: item.confirmed
+                                    ? Colors.greenAccent
+                                    : Colors.redAccent,
+                                size: 22,
+                              ),
+                            ),
+                            const Spacer(),
+                            Icon(
+                              Icons.volume_up_rounded,
+                              color: Theme.of(context).colorScheme.primary,
+                              size: 42,
+                            ),
+                            const SizedBox(height: 12),
+                            Text(
+                              item.name,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: Text(
+                                formatDuration(item.durationMs),
+                                maxLines: 1,
+                                style: const TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            LinearProgressIndicator(
+                              value: item.confirmed ? 1 : 0,
+                              minHeight: 4,
+                            ),
+                            const Spacer(),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              );
             },
-          );
-        }))]),
-      );
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 class AudioPage extends StatefulWidget {
-  const AudioPage({required this.item, required this.database, required this.onChanged, super.key});
+  const AudioPage({
+    required this.item,
+    required this.database,
+    required this.onChanged,
+    super.key,
+  });
   final AudioItem item;
   final DubDatabase database;
   final VoidCallback onChanged;
@@ -658,13 +1210,13 @@ class _AudioPageState extends State<AudioPage> {
   List<double> _recordedWaveform = [];
   List<InputDevice> _devices = [];
   InputDevice? _selectedDevice;
-  bool _timerEnabled = true;
   bool _recording = false;
   int _countdown = 0;
   double _countdownProgress = 0;
   Timer? _timer;
   Timer? _progressTimer;
   double _progress = 0;
+  String? _activeRecordingPath;
 
   @override
   void initState() {
@@ -689,35 +1241,28 @@ class _AudioPageState extends State<AudioPage> {
     if (playerDuration != null && mounted) {
       setState(() => widget.item.durationMs = playerDuration.inMilliseconds);
     }
-    if (Platform.isWindows || Platform.isLinux) {
-      await _extractDesktopWaveform(sourceDurationMs: playerDuration?.inMilliseconds);
-      return;
-    }
-    try {
-      final directory = await getTemporaryDirectory();
-      final waveformPath = p.join(directory.path, '${widget.item.id}.waveform');
-      final progress = JustWaveform.extract(audioInFile: File(widget.item.sourcePath), waveOutFile: File(waveformPath));
-      await for (final update in progress) {
-        final waveform = update.waveform;
-        if (waveform != null && mounted) {
-          setState(() {
-            _sourceWaveform = waveform.data.map((value) => value.toDouble()).toList();
-            if (playerDuration == null) widget.item.durationMs = waveform.duration.inMilliseconds;
-          });
-        }
-      }
-    } catch (_) {
-      if (mounted) setState(() => _sourceWaveform = const [0.1]);
-    }
+    await _extractDesktopWaveform(
+      sourceDurationMs: playerDuration?.inMilliseconds,
+    );
   }
 
-  Future<void> _extractDesktopWaveform({String? audioPath, int? sourceDurationMs, bool recorded = false}) async {
+  Future<void> _extractDesktopWaveform({
+    String? audioPath,
+    int? sourceDurationMs,
+    bool recorded = false,
+  }) async {
     final directory = await getTemporaryDirectory();
-    final pcmPath = p.join(directory.path, '${widget.item.id}.pcm');
+    final suffix = recorded ? 'recorded' : 'source';
+    final pcmPath = p.join(directory.path, '${widget.item.id}-$suffix.pcm');
     try {
-      final session = await FFmpegKit.execute('-y -i "${audioPath ?? widget.item.sourcePath}" -ac 1 -ar 8000 -f s16le "$pcmPath"');
+      final session = await FFmpegKit.execute(
+        '-y -i "${audioPath ?? widget.item.sourcePath}" -ac 1 -ar 8000 -f s16le "$pcmPath"',
+      );
       final code = await session.getReturnCode();
-      if (code == null || !ReturnCode.isSuccess(code) || !await File(pcmPath).exists()) throw const FormatException();
+      if (code == null ||
+          !ReturnCode.isSuccess(code) ||
+          !await File(pcmPath).exists())
+        throw const FormatException();
       final bytes = await File(pcmPath).readAsBytes();
       final values = <double>[];
       for (var offset = 0; offset + 1 < bytes.length; offset += 2) {
@@ -738,7 +1283,15 @@ class _AudioPageState extends State<AudioPage> {
         });
       }
     } catch (_) {
-      if (mounted) setState(() => _sourceWaveform = const [0.1]);
+      if (mounted) {
+        setState(() {
+          if (recorded) {
+            _recordedWaveform = const [0.1];
+          } else {
+            _sourceWaveform = const [0.1];
+          }
+        });
+      }
     } finally {
       final file = File(pcmPath);
       if (await file.exists()) await file.delete();
@@ -749,60 +1302,135 @@ class _AudioPageState extends State<AudioPage> {
     if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
       try {
         final devices = await _recorder.listInputDevices();
-        if (mounted) setState(() { _devices = devices; _selectedDevice = null; });
+        if (mounted)
+          setState(() {
+            _devices = devices;
+            _selectedDevice = null;
+          });
       } catch (_) {}
     }
   }
 
   Future<void> _record() async {
     if (!await _recorder.hasPermission()) {
-      if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux) await Permission.microphone.request();
-      if (!await _recorder.hasPermission()) { _message('Autorize o microfone para gravar.'); return; }
+      if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux)
+        await Permission.microphone.request();
+      if (!await _recorder.hasPermission()) {
+        _message('Autorize o microfone para gravar.');
+        return;
+      }
     }
-    if (_timerEnabled) {
-      final startedAt = DateTime.now();
-      setState(() { _countdown = 3; _countdownProgress = 0; });
+    final startedAt = DateTime.now();
+      setState(() {
+        _countdown = 3;
+        _countdownProgress = 0;
+      });
       _timer = Timer.periodic(const Duration(milliseconds: 30), (timer) async {
         final elapsed = DateTime.now().difference(startedAt).inMilliseconds;
         if (elapsed >= 3000) {
           timer.cancel();
-          setState(() { _countdown = 0; _countdownProgress = 1; });
+          if (mounted) setState(() {
+            _countdown = 0;
+            _countdownProgress = 1;
+          });
           await _startRecording();
         } else {
-          setState(() { _countdown = ((3000 - elapsed) / 1000).ceil(); _countdownProgress = elapsed / 3000; });
+          setState(() {
+            _countdown = ((3000 - elapsed) / 1000).ceil();
+            _countdownProgress = elapsed / 3000;
+          });
         }
       });
-    } else {
-      await _startRecording();
-    }
+  }
+
+  void _cancelCountdown() {
+    _timer?.cancel();
+    if (!mounted) return;
+    setState(() {
+      _countdown = 0;
+      _countdownProgress = 0;
+    });
   }
 
   Future<void> _startRecording() async {
     try {
-      const recordingSafetyMarginMs = 250;
       final targetDurationMs = max(1, widget.item.durationMs);
+      const recordingMarginMs = 750;
       final directory = await getTemporaryDirectory();
       final path = p.join(directory.path, '${widget.item.id}.wav');
+      _activeRecordingPath = path;
       _amplitudes.clear();
       const sampleRate = 44100;
       const channels = 1;
-      await _recorder.start(RecordConfig(encoder: AudioEncoder.wav, sampleRate: sampleRate, numChannels: channels, device: _selectedDevice), path: path);
+      await _recorder.start(
+        RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: sampleRate,
+          numChannels: channels,
+          device: _selectedDevice,
+        ),
+        path: path,
+      );
       final startedAt = DateTime.now();
-      if (mounted) setState(() { _recording = true; _progress = 0; });
+      if (mounted)
+        setState(() {
+          _recording = true;
+          _progress = 0;
+        });
       _progressTimer = Timer.periodic(const Duration(milliseconds: 30), (_) {
         final elapsed = DateTime.now().difference(startedAt).inMilliseconds;
-        if (mounted) setState(() => _progress = (elapsed / targetDurationMs).clamp(0.0, 1.0));
+        if (mounted)
+          setState(
+            () => _progress = (elapsed / targetDurationMs).clamp(0.0, 1.0),
+          );
       });
-      _amplitudeSubscription = _recorder.onAmplitudeChanged(const Duration(milliseconds: 60)).listen((value) { if (mounted) setState(() => _amplitudes.add(((value.current + 60) / 60).clamp(0.04, 1.0))); });
-      await Future<void>.delayed(Duration(milliseconds: targetDurationMs + recordingSafetyMarginMs));
+      _amplitudeSubscription = _recorder
+          .onAmplitudeChanged(const Duration(milliseconds: 60))
+          .listen((value) {
+            if (mounted)
+              setState(
+                () => _amplitudes.add(
+                  ((value.current + 60) / 60).clamp(0.04, 1.0),
+                ),
+              );
+          });
+      await Future<void>.delayed(
+        Duration(milliseconds: targetDurationMs + recordingMarginMs),
+      );
+      await _finishRecording();
+    } catch (error) {
+      await _amplitudeSubscription?.cancel();
+      _progressTimer?.cancel();
+      await _recorder.cancel();
+      _activeRecordingPath = null;
+      if (mounted) {
+        setState(() => _recording = false);
+        _message('Não foi possível iniciar o microfone: $error');
+      }
+    }
+  }
+
+  Future<void> _finishRecording() async {
+    try {
       final recorded = await _recorder.stop();
       _progressTimer?.cancel();
       await _player.stop();
       await _amplitudeSubscription?.cancel();
-      final recordingPath = recorded ?? path;
-      if (!await File(recordingPath).exists()) throw const FileSystemException('O arquivo da gravação não foi criado.');
+      final recordingPath = recorded ?? _activeRecordingPath;
+      _activeRecordingPath = null;
+      if (recordingPath == null)
+        throw const FileSystemException(
+          'O caminho da gravação não foi criado.',
+        );
+      if (!await File(recordingPath).exists())
+        throw const FileSystemException(
+          'O arquivo da gravação não foi criado.',
+        );
       if (mounted) {
-        setState(() { _recording = false; widget.item.recordingPath = recordingPath; });
+        setState(() {
+          _recording = false;
+          widget.item.recordingPath = recordingPath;
+        });
         await _sessionContainingItem();
         widget.onChanged();
         await _normalizeRecordedWav(recordingPath);
@@ -813,6 +1441,7 @@ class _AudioPageState extends State<AudioPage> {
       await _amplitudeSubscription?.cancel();
       _progressTimer?.cancel();
       await _recorder.cancel();
+      _activeRecordingPath = null;
       if (mounted) {
         setState(() => _recording = false);
         _message('Não foi possível iniciar o microfone: $error');
@@ -821,36 +1450,29 @@ class _AudioPageState extends State<AudioPage> {
   }
 
   Future<void> _extractRecordedWaveform(String path) async {
-    if (Platform.isWindows || Platform.isLinux) {
-      await _extractDesktopWaveform(audioPath: path, recorded: true);
-      return;
-    }
-    try {
-      final directory = await getTemporaryDirectory();
-      final outputPath = p.join(directory.path, '${widget.item.id}.dub.waveform');
-      await for (final update in JustWaveform.extract(audioInFile: File(path), waveOutFile: File(outputPath))) {
-        if (update.waveform != null && mounted) {
-          setState(() => _recordedWaveform = update.waveform!.data.map((value) => value.toDouble()).toList());
-        }
-      }
-    } catch (_) {
-      if (mounted) setState(() => _recordedWaveform = const [0.1]);
-    }
+    await _extractDesktopWaveform(audioPath: path, recorded: true);
   }
 
   Future<void> _normalizeRecordedWav(String path) async {
     if (!Platform.isWindows && !Platform.isLinux) return;
-    final targetDurationMs = max(1, widget.item.durationMs);
     final directory = await getTemporaryDirectory();
-    final normalizedPath = p.join(directory.path, '${widget.item.id}.normalized.wav');
-    final targetSeconds = (targetDurationMs / 1000).toStringAsFixed(3);
+    final normalizedPath = p.join(
+      directory.path,
+      '${widget.item.id}.normalized.wav',
+    );
     try {
-      final session = await FFmpegKit.execute('-y -i "$path" -ac 1 -ar 44100 -c:a pcm_s16le -af "loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur=$targetSeconds" -t $targetSeconds "$normalizedPath"');
+      final session = await FFmpegKit.execute(
+        '-y -i "$path" -ac 1 -ar 44100 -c:a pcm_s16le -af "loudnorm=I=-16:TP=-1.5:LRA=11" "$normalizedPath"',
+      );
       final code = await session.getReturnCode();
-      if (code == null || !ReturnCode.isSuccess(code) || !await File(normalizedPath).exists()) {
+      if (code == null ||
+          !ReturnCode.isSuccess(code) ||
+          !await File(normalizedPath).exists()) {
         return;
       }
-      await File(path).writeAsBytes(await File(normalizedPath).readAsBytes(), flush: true);
+      await File(
+        path,
+      ).writeAsBytes(await File(normalizedPath).readAsBytes(), flush: true);
     } catch (_) {
     } finally {
       final normalizedFile = File(normalizedPath);
@@ -859,14 +1481,21 @@ class _AudioPageState extends State<AudioPage> {
   }
 
   Future<DubSession> _sessionContainingItem() async {
-    final session = (await widget.database.loadFolders()).expand((folder) => folder.sessions).firstWhere((session) => session.items.any((item) => item.id == widget.item.id));
-    final savedItem = session.items.firstWhere((item) => item.id == widget.item.id);
+    final session = (await widget.database.loadFolders())
+        .expand((folder) => folder.sessions)
+        .firstWhere(
+          (session) => session.items.any((item) => item.id == widget.item.id),
+        );
+    final savedItem = session.items.firstWhere(
+      (item) => item.id == widget.item.id,
+    );
     savedItem.durationMs = widget.item.durationMs;
     savedItem.recordingPath = widget.item.recordingPath;
     savedItem.confirmed = widget.item.confirmed;
     await widget.database.updateSession(session);
     return session;
   }
+
   Future<void> _ignoreAudio() async {
     final accepted = await showDialog<bool>(
       context: context,
@@ -874,8 +1503,14 @@ class _AudioPageState extends State<AudioPage> {
         title: const Text('Ignorar áudio?'),
         content: const Text('Certeza que deseja ignorar esse áudio?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Não')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Sim')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Não'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Sim'),
+          ),
         ],
       ),
     );
@@ -886,36 +1521,198 @@ class _AudioPageState extends State<AudioPage> {
     _message('Áudio ignorado e marcado como confirmado.');
   }
 
-  void _message(String text) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text))); }
+  void _message(String text) {
+    if (mounted)
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
 
   @override
-  Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: Text(widget.item.name)), body: ListView(padding: const EdgeInsets.all(24), children: [const Text('Áudio original', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)), const SizedBox(height: 10), if (_countdown > 0) ...[LinearProgressIndicator(value: _countdownProgress), const SizedBox(height: 8), Text('Começando em $_countdown', textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)), const SizedBox(height: 8)], _waveform(_sourceWaveform, Theme.of(context).colorScheme.primary, progress: _recording ? _progress : null), const SizedBox(height: 16), if (_devices.isNotEmpty) DropdownButtonFormField<InputDevice>(initialValue: _selectedDevice, decoration: const InputDecoration(labelText: 'Microfone de gravação'), items: _devices.map((device) => DropdownMenuItem(value: device, child: Text(device.label))).toList(), onChanged: _recording ? null : (device) => setState(() => _selectedDevice = device)), if (_devices.isNotEmpty) const SizedBox(height: 12), Row(children: [IconButton.filled(onPressed: () => _player.play(DeviceFileSource(widget.item.sourcePath)), tooltip: 'Ouvir original', icon: const Icon(Icons.play_arrow_rounded)), IconButton(onPressed: _recording ? null : () => setState(() => _timerEnabled = !_timerEnabled), tooltip: 'Temporizador', color: _timerEnabled ? Theme.of(context).colorScheme.primary : null, icon: const Icon(Icons.timer_outlined)), FilledButton.icon(onPressed: _recording || _countdown > 0 ? null : _record, icon: const Icon(Icons.mic_none_rounded), label: Text(_recording ? 'Gravando...' : _countdown > 0 ? '$_countdown' : 'Gravar')), const SizedBox(width: 8), OutlinedButton.icon(onPressed: _recording || _countdown > 0 || widget.item.confirmed ? null : _ignoreAudio, icon: const Icon(Icons.skip_next_rounded), label: const Text('Ignorar'))]), if (_recording) ...[const SizedBox(height: 22), const Text('Gravando agora', style: TextStyle(fontWeight: FontWeight.w700)), const SizedBox(height: 8), _waveform(_amplitudes, Colors.redAccent)], if (widget.item.recordingPath != null && !_recording) ...[const SizedBox(height: 30), const Text('Sua dublagem', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)), const SizedBox(height: 10), _waveform(_recordedWaveform, Colors.greenAccent), Row(children: [IconButton.filled(onPressed: () => _player.play(DeviceFileSource(widget.item.recordingPath!)), tooltip: 'Ouvir dublagem', icon: const Icon(Icons.play_arrow_rounded)), OutlinedButton.icon(onPressed: () async { setState(() => widget.item.confirmed = true); await widget.database.save(await _sessionContainingItem()); widget.onChanged(); }, icon: const Icon(Icons.check_rounded), label: Text(widget.item.confirmed ? 'Confirmada' : 'Confirmar'))])]]));
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: Text(widget.item.name)),
+    body: ListView(
+      padding: const EdgeInsets.all(24),
+      children: [
+        const Text(
+          'Áudio original',
+          style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 10),
+        if (_countdown > 0) ...[
+          LinearProgressIndicator(value: _countdownProgress),
+          const SizedBox(height: 8),
+          Text(
+            'Começando em $_countdown',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70),
+          ),
+          TextButton.icon(
+            onPressed: _cancelCountdown,
+            icon: const Icon(Icons.stop_circle_outlined),
+            label: const Text('Desligar timer'),
+          ),
+          const SizedBox(height: 8),
+        ],
+        _waveform(
+          _sourceWaveform,
+          Theme.of(context).colorScheme.primary,
+          progress: _recording ? _progress : null,
+        ),
+        const SizedBox(height: 16),
+        if (_devices.isNotEmpty)
+          DropdownButtonFormField<InputDevice>(
+            initialValue: _selectedDevice,
+            decoration: const InputDecoration(
+              labelText: 'Microfone de gravação',
+            ),
+            items: _devices
+                .map(
+                  (device) => DropdownMenuItem(
+                    value: device,
+                    child: Text(device.label),
+                  ),
+                )
+                .toList(),
+            onChanged: _recording
+                ? null
+                : (device) => setState(() => _selectedDevice = device),
+          ),
+        if (_devices.isNotEmpty) const SizedBox(height: 12),
+        Row(
+          children: [
+            IconButton.filled(
+              onPressed: () =>
+                  _player.play(DeviceFileSource(widget.item.sourcePath)),
+              tooltip: 'Ouvir original',
+              icon: const Icon(Icons.play_arrow_rounded),
+            ),
+            FilledButton.icon(
+              onPressed: _countdown > 0
+                  ? null
+                  : _recording ? null : _record,
+              icon: Icon(
+                Icons.timer_outlined,
+              ),
+              label: Text(
+                _countdown > 0 ? '$_countdown' : 'Gravar',
+              ),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: _recording || _countdown > 0 || widget.item.confirmed
+                  ? null
+                  : _ignoreAudio,
+              icon: const Icon(Icons.skip_next_rounded),
+              label: const Text('Ignorar'),
+            ),
+          ],
+        ),
+        if (_recording) ...[
+          const SizedBox(height: 22),
+          const Text(
+            'Gravando agora',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          _waveform(_amplitudes, Colors.redAccent),
+        ],
+        if (widget.item.recordingPath != null && !_recording) ...[
+          const SizedBox(height: 30),
+          const Text(
+            'Sua dublagem',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 10),
+          _waveform(_recordedWaveform, Colors.greenAccent),
+          Row(
+            children: [
+              IconButton.filled(
+                onPressed: () =>
+                    _player.play(DeviceFileSource(widget.item.recordingPath!)),
+                tooltip: 'Ouvir dublagem',
+                icon: const Icon(Icons.play_arrow_rounded),
+              ),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  setState(() => widget.item.confirmed = true);
+                  await widget.database.save(await _sessionContainingItem());
+                  widget.onChanged();
+                },
+                icon: const Icon(Icons.check_rounded),
+                label: Text(widget.item.confirmed ? 'Confirmada' : 'Confirmar'),
+              ),
+            ],
+          ),
+        ],
+      ],
+    ),
+  );
 
-  Widget _waveform(List<double> values, Color color, {double? progress}) => Align(alignment: Alignment.center, child: Container(height: 130, width: progress == null ? double.infinity : min(MediaQuery.of(context).size.width - 48, 620) * .72, decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)), child: Stack(children: [CustomPaint(painter: WavePainter(values, color, progress: progress), child: const SizedBox.expand()), if (progress != null) const Positioned.fill(child: CustomPaint(painter: ProgressPainter()))])));
+  Widget _waveform(List<double> values, Color color, {double? progress}) =>
+      Align(
+        alignment: Alignment.center,
+        child: Container(
+          height: 130,
+          width: progress == null
+              ? double.infinity
+              : min(MediaQuery.of(context).size.width - 48, 620) * .72,
+          decoration: BoxDecoration(
+            color: Colors.black,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Stack(
+            children: [
+              CustomPaint(
+                painter: WavePainter(values, color, progress: progress),
+                child: const SizedBox.expand(),
+              ),
+              if (progress != null)
+                const Positioned.fill(
+                  child: CustomPaint(painter: ProgressPainter()),
+                ),
+            ],
+          ),
+        ),
+      );
 }
 
 class WavePainter extends CustomPainter {
-  WavePainter(this.values, this.color, {this.progress});
+  WavePainter(this.values, this.color, {this.progress, this.horizontalOffset = 0});
   final List<double> values;
   final Color color;
   final double? progress;
+  final double horizontalOffset;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()..color = color.withValues(alpha: .85)..strokeWidth = 2;
+    final paint = Paint()
+      ..color = color.withValues(alpha: .85)
+      ..strokeWidth = 2;
     if (values.isEmpty) return;
     final count = max(1, min(values.length, (size.width / 4).floor()));
     for (var index = 0; index < count; index++) {
-      final value = values[index * values.length ~/ count].abs().clamp(.04, 1.0);
+      final value = values[index * values.length ~/ count].abs().clamp(
+        .04,
+        1.0,
+      );
       final height = max(4.0, value * size.height * .9);
       final normalPosition = index / count;
-      final x = progress == null ? normalPosition * size.width : size.width / 2 + (normalPosition - (progress ?? 0)) * size.width;
-      canvas.drawLine(Offset(x, (size.height - height) / 2), Offset(x, (size.height + height) / 2), paint);
+      final x = progress == null
+          ? normalPosition * size.width
+          : size.width / 2 + (normalPosition - (progress ?? 0)) * size.width;
+      canvas.drawLine(
+        Offset(x + horizontalOffset, (size.height - height) / 2),
+        Offset(x + horizontalOffset, (size.height + height) / 2),
+        paint,
+      );
     }
   }
 
   @override
-  bool shouldRepaint(covariant WavePainter oldDelegate) => oldDelegate.values != values || oldDelegate.color != color || oldDelegate.progress != progress;
+  bool shouldRepaint(covariant WavePainter oldDelegate) =>
+      oldDelegate.values != values ||
+      oldDelegate.color != color ||
+      oldDelegate.progress != progress ||
+      oldDelegate.horizontalOffset != horizontalOffset;
 }
 
 class ProgressPainter extends CustomPainter {
@@ -923,7 +1720,9 @@ class ProgressPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()..color = Colors.white..strokeWidth = 3;
+    final paint = Paint()
+      ..color = Colors.white
+      ..strokeWidth = 3;
     final x = size.width / 2;
     canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
   }

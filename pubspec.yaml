@@ -1,7 +1,7 @@
 name: kaitodub
 description: "A new Flutter project."
 publish_to: 'none'
-version: 0.1.5
+version: 0.1.7
 
 environment:
   sdk: ^3.10.1
@@ -13,7 +13,6 @@ dependencies:
   audioplayers: ^6.5.0
   file_picker: ^10.3.3
   ffmpeg_kit_flutter_new: ^4.6.2
-  just_waveform: ^0.0.7
   open_filex: ^4.7.0
   path: ^1.9.1
   path_provider: ^2.1.5
