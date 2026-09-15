@@ -94,6 +94,39 @@ int confirmedDuration(List<AudioItem> items) => items
     .where((item) => item.confirmed)
     .fold(0, (total, item) => total + item.durationMs);
 
+enum SessionSortMode { name, confirmed, unconfirmed }
+
+int compareAudioNames(AudioItem first, AudioItem second) {
+  final firstName = first.name.toLowerCase();
+  final secondName = second.name.toLowerCase();
+  final firstNumber = int.tryParse(firstName);
+  final secondNumber = int.tryParse(secondName);
+  if (firstNumber != null && secondNumber != null) {
+    return firstNumber.compareTo(secondNumber);
+  }
+  return firstName.compareTo(secondName);
+}
+
+String _archiveFileName(String name) {
+  final sanitized = name.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
+  return sanitized.isEmpty ? 'arquivo' : sanitized;
+}
+
+Future<Uint8List> _encodeSessionArchive(DubSession session) async {
+  final archive = Archive();
+  for (final item in session.items) {
+    final source = item.confirmed && item.recordingPath != null
+        ? item.recordingPath!
+        : item.sourcePath;
+    final data = await File(source).readAsBytes();
+    final fileName = item.confirmed
+        ? '${item.name}_dubbed.wav'
+        : '${item.name}${item.extension}';
+    archive.addFile(ArchiveFile(fileName, data.length, data));
+  }
+  return Uint8List.fromList(ZipEncoder().encode(archive));
+}
+
 final _store = stringMapStoreFactory.store('sessions');
 final _folderStore = stringMapStoreFactory.store('folders');
 
@@ -736,6 +769,13 @@ class _LibraryPageState extends State<LibraryPage> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     IconButton(
+                      onPressed: _busy
+                          ? null
+                          : () => _exportFolder(folderData),
+                      tooltip: 'Exportar pasta',
+                      icon: const Icon(Icons.archive_outlined),
+                    ),
+                    IconButton(
                       onPressed: _busy ? null : () => _deleteFolder(folderData),
                       tooltip: 'Excluir pasta',
                       icon: const Icon(Icons.delete_outline_rounded),
@@ -792,6 +832,61 @@ class _LibraryPageState extends State<LibraryPage> {
         ],
       ),
     );
+  }
+
+  Future<void> _exportFolder(DubFolder folderData) async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _busyProgress = 0;
+      _busyMessage = 'Preparando exportação da pasta...';
+    });
+    try {
+      final archive = Archive();
+      final sessions = folderData.sessions;
+      for (var index = 0; index < sessions.length; index++) {
+        final session = sessions[index];
+        final bytes = await _encodeSessionArchive(session);
+        final fileName =
+            '${(index + 1).toString().padLeft(2, '0')}_${_archiveFileName(session.name)}.zip';
+        archive.addFile(ArchiveFile(fileName, bytes.length, bytes));
+        if (mounted) {
+          setState(() {
+            _busyProgress = (index + 1) / sessions.length * .8;
+            _busyMessage =
+                'Compactando arquivo ${index + 1} de ${sessions.length}...';
+          });
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _busyProgress = .9;
+          _busyMessage = 'Gerando ZIP da pasta...';
+        });
+      }
+      final encoded = Uint8List.fromList(ZipEncoder().encode(archive));
+      final output = await FilePicker.platform.saveFile(
+        dialogTitle: 'Escolha onde salvar a pasta exportada',
+        fileName: '${_archiveFileName(folderData.name)}.zip',
+        type: FileType.custom,
+        allowedExtensions: ['zip'],
+        bytes: encoded,
+      );
+      if (output != null && mounted) {
+        _message('Pasta exportada para $output');
+      }
+    } catch (error) {
+      if (mounted) {
+        _message('Não foi possível exportar a pasta: $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _busyProgress = null;
+        });
+      }
+    }
   }
 }
 
@@ -885,6 +980,30 @@ class _SessionPageState extends State<SessionPage> {
   bool _exporting = false;
   double _exportProgress = 0;
   String _exportMessage = '';
+  SessionSortMode _sortMode = SessionSortMode.name;
+
+  List<AudioItem> get _visibleItems {
+    final items = [...widget.session.items];
+    switch (_sortMode) {
+      case SessionSortMode.name:
+        items.sort(compareAudioNames);
+      case SessionSortMode.confirmed:
+        items.sort((first, second) {
+          final status = (second.confirmed ? 1 : 0).compareTo(
+            first.confirmed ? 1 : 0,
+          );
+          return status == 0 ? compareAudioNames(first, second) : status;
+        });
+      case SessionSortMode.unconfirmed:
+        items.sort((first, second) {
+          final status = (first.confirmed ? 1 : 0).compareTo(
+            second.confirmed ? 1 : 0,
+          );
+          return status == 0 ? compareAudioNames(first, second) : status;
+        });
+    }
+    return items;
+  }
 
   @override
   void dispose() {
@@ -1050,6 +1169,26 @@ class _SessionPageState extends State<SessionPage> {
     appBar: AppBar(
       title: Text(widget.session.name),
       actions: [
+        PopupMenuButton<SessionSortMode>(
+          tooltip: 'Ordenar áudios',
+          icon: const Icon(Icons.sort_rounded),
+          initialValue: _sortMode,
+          onSelected: (mode) => setState(() => _sortMode = mode),
+          itemBuilder: (context) => const [
+            PopupMenuItem(
+              value: SessionSortMode.name,
+              child: Text('Ordenar por nome'),
+            ),
+            PopupMenuItem(
+              value: SessionSortMode.confirmed,
+              child: Text('Confirmados primeiro'),
+            ),
+            PopupMenuItem(
+              value: SessionSortMode.unconfirmed,
+              child: Text('Não confirmados primeiro'),
+            ),
+          ],
+        ),
         IconButton(
           onPressed: _exporting ? null : _export,
           tooltip: 'Exportar',
@@ -1102,9 +1241,9 @@ class _SessionPageState extends State<SessionPage> {
                   mainAxisSpacing: 14,
                   mainAxisExtent: max(210.0, cardWidth * 1.2),
                 ),
-                itemCount: widget.session.items.length,
+                itemCount: _visibleItems.length,
                 itemBuilder: (context, index) {
-                  final item = widget.session.items[index];
+                  final item = _visibleItems[index];
                   return Card(
                     child: InkWell(
                       onTap: () => Navigator.push(
@@ -1211,6 +1350,7 @@ class _AudioPageState extends State<AudioPage> {
   List<InputDevice> _devices = [];
   InputDevice? _selectedDevice;
   bool _recording = false;
+  bool _countdownEnabled = true;
   int _countdown = 0;
   double _countdownProgress = 0;
   Timer? _timer;
@@ -1233,6 +1373,18 @@ class _AudioPageState extends State<AudioPage> {
     _player.dispose();
     _recorder.dispose();
     super.dispose();
+  }
+
+  Future<void> _playAudio(String path, String label) async {
+    if (!await File(path).exists()) {
+      _message('$label não foi encontrado neste dispositivo.');
+      return;
+    }
+    try {
+      await _player.play(DeviceFileSource(path));
+    } catch (error) {
+      _message('Não foi possível reproduzir $label: $error');
+    }
   }
 
   Future<void> _extractWaveform() async {
@@ -1319,6 +1471,10 @@ class _AudioPageState extends State<AudioPage> {
         _message('Autorize o microfone para gravar.');
         return;
       }
+    }
+    if (!_countdownEnabled) {
+      await _startRecording();
+      return;
     }
     final startedAt = DateTime.now();
       setState(() {
@@ -1580,8 +1736,7 @@ class _AudioPageState extends State<AudioPage> {
         Row(
           children: [
             IconButton.filled(
-              onPressed: () =>
-                  _player.play(DeviceFileSource(widget.item.sourcePath)),
+              onPressed: () => _playAudio(widget.item.sourcePath, 'o áudio original'),
               tooltip: 'Ouvir original',
               icon: const Icon(Icons.play_arrow_rounded),
             ),
@@ -1595,6 +1750,20 @@ class _AudioPageState extends State<AudioPage> {
               label: Text(
                 _countdown > 0 ? '$_countdown' : 'Gravar',
               ),
+            ),
+            IconButton(
+              onPressed: _recording || _countdown > 0
+                  ? null
+                  : () => setState(() => _countdownEnabled = !_countdownEnabled),
+              tooltip: _countdownEnabled
+                  ? 'Desativar contador'
+                  : 'Ativar contador',
+              icon: Icon(
+                _countdownEnabled
+                    ? Icons.timer_outlined
+                    : Icons.timer_off_outlined,
+              ),
+              color: _countdownEnabled ? null : Colors.orangeAccent,
             ),
             const SizedBox(width: 8),
             OutlinedButton.icon(
@@ -1626,8 +1795,10 @@ class _AudioPageState extends State<AudioPage> {
           Row(
             children: [
               IconButton.filled(
-                onPressed: () =>
-                    _player.play(DeviceFileSource(widget.item.recordingPath!)),
+                onPressed: () => _playAudio(
+                  widget.item.recordingPath!,
+                  'a sua dublagem',
+                ),
                 tooltip: 'Ouvir dublagem',
                 icon: const Icon(Icons.play_arrow_rounded),
               ),
