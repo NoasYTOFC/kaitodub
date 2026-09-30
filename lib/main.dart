@@ -112,6 +112,18 @@ String _archiveFileName(String name) {
   return sanitized.isEmpty ? 'arquivo' : sanitized;
 }
 
+Future<Directory> _recordingsDirectory() async {
+  final root = await getApplicationSupportDirectory();
+  final directory = Directory(p.join(root.path, 'recordings'));
+  await directory.create(recursive: true);
+  return directory;
+}
+
+Future<String> _persistentRecordingPath(String itemId) async {
+  final directory = await _recordingsDirectory();
+  return p.join(directory.path, '$itemId.wav');
+}
+
 Future<Uint8List> _encodeSessionArchive(DubSession session) async {
   final archive = Archive();
   for (final item in session.items) {
@@ -272,6 +284,7 @@ class _LibraryPageState extends State<LibraryPage> {
       _busyMessage = 'Carregando sessões...';
     });
     _folders = await _database.loadFolders();
+    await _migrateRecordings();
     _folders.sort(
       (first, second) =>
           _folderItemCount(second).compareTo(_folderItemCount(first)),
@@ -283,6 +296,76 @@ class _LibraryPageState extends State<LibraryPage> {
     );
     if (mounted) setState(() => _busy = false);
     await _checkForUpdate();
+  }
+
+  Future<void> _migrateRecordings() async {
+    final recordingsDirectory = await _recordingsDirectory();
+    final temporaryDirectory = await getTemporaryDirectory();
+    var migrated = false;
+    for (final folder in _folders) {
+      for (final session in folder.sessions) {
+        for (final item in session.items) {
+          final oldPath = item.recordingPath;
+          if (oldPath == null) continue;
+          final destination = File(
+            p.join(recordingsDirectory.path, '${item.id}.wav'),
+          );
+          final source = await _findRecordingSource(
+            item,
+            destination,
+            temporaryDirectory,
+          );
+          if (source == null) continue;
+          if (p.normalize(source.path) != p.normalize(destination.path)) {
+            if (!await destination.exists()) {
+              await source.copy(destination.path);
+            }
+            if (await source.exists()) await source.delete();
+          }
+          if (item.recordingPath != destination.path) {
+            item.recordingPath = destination.path;
+            migrated = true;
+          }
+        }
+      }
+    }
+    if (migrated) {
+      for (final folder in _folders) {
+        await _database.saveFolder(folder);
+      }
+    }
+  }
+
+  Future<File?> _findRecordingSource(
+    AudioItem item,
+    File destination,
+    Directory temporaryDirectory,
+  ) async {
+    if (await destination.exists()) return destination;
+
+    final oldPath = item.recordingPath;
+    final names = <String>{'${item.id}.wav'};
+    if (oldPath != null) names.add(p.basename(oldPath));
+    final directPaths = <String>{
+      if (oldPath != null) oldPath,
+      for (final name in names) p.join(temporaryDirectory.path, name),
+    };
+    for (final path in directPaths) {
+      final file = File(path);
+      if (await file.exists()) return file;
+    }
+
+    try {
+      await for (final entity in temporaryDirectory.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        if (entity is File && names.contains(p.basename(entity.path))) {
+          return entity;
+        }
+      }
+    } catch (_) {}
+    return null;
   }
 
   int _folderItemCount(DubFolder folder) =>
@@ -769,9 +852,7 @@ class _LibraryPageState extends State<LibraryPage> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     IconButton(
-                      onPressed: _busy
-                          ? null
-                          : () => _exportFolder(folderData),
+                      onPressed: _busy ? null : () => _exportFolder(folderData),
                       tooltip: 'Exportar pasta',
                       icon: const Icon(Icons.archive_outlined),
                     ),
@@ -1025,7 +1106,10 @@ class _SessionPageState extends State<SessionPage> {
       '-y -i "$source" -ac 1 -ar 44100 -c:a pcm_s16le -af "$filter" "$output"',
     );
     final code = await session.getReturnCode();
-    if (code == null || !ReturnCode.isSuccess(code) || !await File(output).exists()) return source;
+    if (code == null ||
+        !ReturnCode.isSuccess(code) ||
+        !await File(output).exists())
+      return source;
     return output;
   }
 
@@ -1070,8 +1154,8 @@ class _SessionPageState extends State<SessionPage> {
             ? item.recordingPath!
             : item.sourcePath;
         final alignedSource = item.confirmed && item.recordingPath != null
-          ? await _alignedExportPath(item)
-          : source;
+            ? await _alignedExportPath(item)
+            : source;
         final data = await File(alignedSource).readAsBytes();
         if (alignedSource != source) await File(alignedSource).delete();
         final fileName = item.confirmed
@@ -1357,6 +1441,9 @@ class _AudioPageState extends State<AudioPage> {
   Timer? _progressTimer;
   double _progress = 0;
   String? _activeRecordingPath;
+  bool _recordingBusy = false;
+  bool _finishingRecording = false;
+  int _recordingAttempt = 0;
 
   @override
   void initState() {
@@ -1368,6 +1455,7 @@ class _AudioPageState extends State<AudioPage> {
   @override
   void dispose() {
     _timer?.cancel();
+    _recordingAttempt++;
     _progressTimer?.cancel();
     _amplitudeSubscription?.cancel();
     _player.dispose();
@@ -1464,43 +1552,69 @@ class _AudioPageState extends State<AudioPage> {
   }
 
   Future<void> _record() async {
-    if (!await _recorder.hasPermission()) {
-      if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux)
-        await Permission.microphone.request();
+    if (_recordingBusy) return;
+    _recordingBusy = true;
+    try {
       if (!await _recorder.hasPermission()) {
-        _message('Autorize o microfone para gravar.');
-        return;
+        if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux)
+          await Permission.microphone.request();
+        if (!await _recorder.hasPermission()) {
+          _recordingBusy = false;
+          _message('Autorize o microfone para gravar.');
+          return;
+        }
       }
-    }
-    if (!_countdownEnabled) {
-      await _startRecording();
+    } catch (error) {
+      _recordingBusy = false;
+      _message('Não foi possível acessar o microfone: $error');
       return;
     }
+    if (!_countdownEnabled) {
+      try {
+        await _startRecording();
+      } finally {
+        _recordingBusy = false;
+      }
+      return;
+    }
+    final attempt = ++_recordingAttempt;
     final startedAt = DateTime.now();
-      setState(() {
-        _countdown = 3;
-        _countdownProgress = 0;
-      });
-      _timer = Timer.periodic(const Duration(milliseconds: 30), (timer) async {
-        final elapsed = DateTime.now().difference(startedAt).inMilliseconds;
-        if (elapsed >= 3000) {
-          timer.cancel();
-          if (mounted) setState(() {
+    setState(() {
+      _countdown = 3;
+      _countdownProgress = 0;
+    });
+    _timer = Timer.periodic(const Duration(milliseconds: 30), (timer) async {
+      if (!_recordingBusy || attempt != _recordingAttempt) {
+        timer.cancel();
+        return;
+      }
+      final elapsed = DateTime.now().difference(startedAt).inMilliseconds;
+      if (elapsed >= 3000) {
+        timer.cancel();
+        if (mounted)
+          setState(() {
             _countdown = 0;
             _countdownProgress = 1;
           });
+        try {
           await _startRecording();
-        } else {
+        } finally {
+          _recordingBusy = false;
+        }
+      } else {
+        if (mounted)
           setState(() {
             _countdown = ((3000 - elapsed) / 1000).ceil();
             _countdownProgress = elapsed / 3000;
           });
-        }
-      });
+      }
+    });
   }
 
   void _cancelCountdown() {
     _timer?.cancel();
+    _recordingAttempt++;
+    _recordingBusy = false;
     if (!mounted) return;
     setState(() {
       _countdown = 0;
@@ -1512,8 +1626,9 @@ class _AudioPageState extends State<AudioPage> {
     try {
       final targetDurationMs = max(1, widget.item.durationMs);
       const recordingMarginMs = 750;
-      final directory = await getTemporaryDirectory();
-      final path = p.join(directory.path, '${widget.item.id}.wav');
+      final path = await _persistentRecordingPath(widget.item.id);
+      final previousRecording = File(path);
+      if (await previousRecording.exists()) await previousRecording.delete();
       _activeRecordingPath = path;
       _amplitudes.clear();
       const sampleRate = 44100;
@@ -1557,7 +1672,9 @@ class _AudioPageState extends State<AudioPage> {
     } catch (error) {
       await _amplitudeSubscription?.cancel();
       _progressTimer?.cancel();
-      await _recorder.cancel();
+      try {
+        await _recorder.cancel();
+      } catch (_) {}
       _activeRecordingPath = null;
       if (mounted) {
         setState(() => _recording = false);
@@ -1567,6 +1684,8 @@ class _AudioPageState extends State<AudioPage> {
   }
 
   Future<void> _finishRecording() async {
+    if (_finishingRecording) return;
+    _finishingRecording = true;
     try {
       final recorded = await _recorder.stop();
       _progressTimer?.cancel();
@@ -1596,12 +1715,16 @@ class _AudioPageState extends State<AudioPage> {
     } catch (error) {
       await _amplitudeSubscription?.cancel();
       _progressTimer?.cancel();
-      await _recorder.cancel();
+      try {
+        await _recorder.cancel();
+      } catch (_) {}
       _activeRecordingPath = null;
       if (mounted) {
         setState(() => _recording = false);
         _message('Não foi possível iniciar o microfone: $error');
       }
+    } finally {
+      _finishingRecording = false;
     }
   }
 
@@ -1736,25 +1859,27 @@ class _AudioPageState extends State<AudioPage> {
         Row(
           children: [
             IconButton.filled(
-              onPressed: () => _playAudio(widget.item.sourcePath, 'o áudio original'),
+              onPressed: () =>
+                  _playAudio(widget.item.sourcePath, 'o áudio original'),
               tooltip: 'Ouvir original',
               icon: const Icon(Icons.play_arrow_rounded),
             ),
             FilledButton.icon(
-              onPressed: _countdown > 0
+              onPressed: _recordingBusy
                   ? null
-                  : _recording ? null : _record,
-              icon: Icon(
-                Icons.timer_outlined,
-              ),
-              label: Text(
-                _countdown > 0 ? '$_countdown' : 'Gravar',
-              ),
+                  : _countdown > 0
+                  ? null
+                  : _recording
+                  ? null
+                  : _record,
+              icon: Icon(Icons.timer_outlined),
+              label: Text(_countdown > 0 ? '$_countdown' : 'Gravar'),
             ),
             IconButton(
               onPressed: _recording || _countdown > 0
                   ? null
-                  : () => setState(() => _countdownEnabled = !_countdownEnabled),
+                  : () =>
+                        setState(() => _countdownEnabled = !_countdownEnabled),
               tooltip: _countdownEnabled
                   ? 'Desativar contador'
                   : 'Ativar contador',
@@ -1795,10 +1920,8 @@ class _AudioPageState extends State<AudioPage> {
           Row(
             children: [
               IconButton.filled(
-                onPressed: () => _playAudio(
-                  widget.item.recordingPath!,
-                  'a sua dublagem',
-                ),
+                onPressed: () =>
+                    _playAudio(widget.item.recordingPath!, 'a sua dublagem'),
                 tooltip: 'Ouvir dublagem',
                 icon: const Icon(Icons.play_arrow_rounded),
               ),
@@ -1847,7 +1970,12 @@ class _AudioPageState extends State<AudioPage> {
 }
 
 class WavePainter extends CustomPainter {
-  WavePainter(this.values, this.color, {this.progress, this.horizontalOffset = 0});
+  WavePainter(
+    this.values,
+    this.color, {
+    this.progress,
+    this.horizontalOffset = 0,
+  });
   final List<double> values;
   final Color color;
   final double? progress;
