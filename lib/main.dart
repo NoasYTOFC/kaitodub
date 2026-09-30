@@ -139,6 +139,41 @@ Future<Uint8List> _encodeSessionArchive(DubSession session) async {
   return Uint8List.fromList(ZipEncoder().encode(archive));
 }
 
+Future<DubSession?> _sessionFromArchive({
+  required Archive archive,
+  required Directory folder,
+  required String sessionId,
+  required String sessionName,
+  required Set<String> audioExtensions,
+}) async {
+  final audioEntries = archive.files
+      .where(
+        (entry) =>
+            entry.isFile &&
+            audioExtensions.contains(p.extension(entry.name).toLowerCase()),
+      )
+      .toList();
+  if (audioEntries.isEmpty) return null;
+
+  final sessionFolder = Directory(p.join(folder.path, sessionId));
+  await sessionFolder.create(recursive: true);
+  final items = <AudioItem>[];
+  for (final entry in audioEntries) {
+    final entryExtension = p.extension(entry.name).toLowerCase();
+    final path = p.join(sessionFolder.path, '${items.length}$entryExtension');
+    await File(path).writeAsBytes(entry.content as List<int>);
+    items.add(
+      AudioItem(
+        id: '$sessionId-${items.length}',
+        name: p.basenameWithoutExtension(entry.name),
+        sourcePath: path,
+        extension: entryExtension,
+      ),
+    );
+  }
+  return DubSession(id: sessionId, name: sessionName, items: items);
+}
+
 final _store = stringMapStoreFactory.store('sessions');
 final _folderStore = stringMapStoreFactory.store('folders');
 
@@ -620,43 +655,39 @@ class _LibraryPageState extends State<LibraryPage> {
           final bytes = selectedFile.bytes;
           if (bytes == null) continue;
           final archive = ZipDecoder().decodeBytes(bytes);
-          final audioEntries = archive.files
+          final nestedZipEntries = archive.files
               .where(
                 (entry) =>
                     entry.isFile &&
-                    audioExtensions.contains(
-                      p.extension(entry.name).toLowerCase(),
-                    ),
+                    p.extension(entry.name).toLowerCase() == '.zip',
               )
               .toList();
-          final sessionId = '$folderId-$fileIndex';
-          final sessionFolder = Directory(p.join(folder.path, sessionId));
-          await sessionFolder.create(recursive: true);
-          final items = <AudioItem>[];
-          for (final entry in audioEntries) {
-            final entryExtension = p.extension(entry.name).toLowerCase();
-            final path = p.join(
-              sessionFolder.path,
-              '${items.length}$entryExtension',
+          final directSession = await _sessionFromArchive(
+            archive: archive,
+            folder: folder,
+            sessionId: '$folderId-$fileIndex',
+            sessionName: p.basenameWithoutExtension(selectedFile.name),
+            audioExtensions: audioExtensions,
+          );
+          if (directSession != null) sessions.add(directSession);
+          for (
+            var nestedIndex = 0;
+            nestedIndex < nestedZipEntries.length;
+            nestedIndex++
+          ) {
+            final nestedEntry = nestedZipEntries[nestedIndex];
+            final nestedArchive = ZipDecoder().decodeBytes(
+              nestedEntry.content as List<int>,
             );
-            await File(path).writeAsBytes(entry.content as List<int>);
-            items.add(
-              AudioItem(
-                id: '$sessionId-${items.length}',
-                name: p.basenameWithoutExtension(entry.name),
-                sourcePath: path,
-                extension: entryExtension,
-              ),
+            final nestedSession = await _sessionFromArchive(
+              archive: nestedArchive,
+              folder: folder,
+              sessionId: '$folderId-$fileIndex-$nestedIndex',
+              sessionName: p.basenameWithoutExtension(nestedEntry.name),
+              audioExtensions: audioExtensions,
             );
+            if (nestedSession != null) sessions.add(nestedSession);
           }
-          if (items.isNotEmpty)
-            sessions.add(
-              DubSession(
-                id: sessionId,
-                name: p.basenameWithoutExtension(selectedFile.name),
-                items: items,
-              ),
-            );
         } else if (audioExtensions.contains(extension)) {
           final bytes =
               selectedFile.bytes ??
