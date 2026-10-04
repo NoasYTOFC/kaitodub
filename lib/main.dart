@@ -52,6 +52,7 @@ class AudioItem {
     this.recordingPath,
     this.recordingOffsetMs = 0,
     this.confirmed = false,
+    this.incomplete = false,
   });
   final String id;
   final String name;
@@ -61,6 +62,7 @@ class AudioItem {
   String? recordingPath;
   int recordingOffsetMs;
   bool confirmed;
+  bool incomplete;
 }
 
 class DubSession {
@@ -94,7 +96,7 @@ int confirmedDuration(List<AudioItem> items) => items
     .where((item) => item.confirmed)
     .fold(0, (total, item) => total + item.durationMs);
 
-enum SessionSortMode { name, confirmed, unconfirmed }
+enum SessionSortMode { consultFirst, confirmed, unconfirmed }
 
 int compareAudioNames(AudioItem first, AudioItem second) {
   final firstName = first.name.toLowerCase();
@@ -176,6 +178,8 @@ Future<DubSession?> _sessionFromArchive({
 
 final _store = stringMapStoreFactory.store('sessions');
 final _folderStore = stringMapStoreFactory.store('folders');
+final _settingsStore = stringMapStoreFactory.store('settings');
+const _appVersion = '0.2.2';
 
 class DubDatabase {
   Database? _db;
@@ -202,6 +206,7 @@ class DubDatabase {
         recordingPath: value['recordingPath'] as String?,
         recordingOffsetMs: value['recordingOffsetMs'] as int? ?? 0,
         confirmed: value['confirmed'] as bool? ?? false,
+        incomplete: value['incomplete'] as bool? ?? false,
       );
     }).toList();
     return DubSession(id: id, name: data['name'] as String, items: items);
@@ -257,6 +262,7 @@ class DubDatabase {
             'recordingPath': item.recordingPath,
             'recordingOffsetMs': item.recordingOffsetMs,
             'confirmed': item.confirmed,
+            'incomplete': item.incomplete,
           },
         )
         .toList(),
@@ -289,6 +295,16 @@ class DubDatabase {
     final index = folder.sessions.indexWhere((saved) => saved.id == session.id);
     folder.sessions[index] = session;
     await saveFolder(folder);
+  }
+
+  Future<bool> hasSeenVersionNotice(String version) async =>
+      (await _settingsStore.record('notice-$version').get(await database)) !=
+      null;
+
+  Future<void> markVersionNoticeAsSeen(String version) async {
+    await _settingsStore.record('notice-$version').put(await database, {
+      'seenAt': DateTime.now().millisecondsSinceEpoch,
+    });
   }
 }
 
@@ -330,7 +346,48 @@ class _LibraryPageState extends State<LibraryPage> {
           .expand((session) => session.items),
     );
     if (mounted) setState(() => _busy = false);
+    await _showVersionNotice();
     await _checkForUpdate();
+  }
+
+  Future<void> _showVersionNotice() async {
+    if (!mounted) return;
+    if (await _database.hasSeenVersionNotice(_appVersion)) return;
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Novidades da versão 0.2.2'),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '• Tempo Extra: adicione até 3 segundos à gravação para terminar sua fala com mais liberdade.',
+            ),
+            SizedBox(height: 12),
+            Text(
+              '• Marcar para consultar: deixe áudios com dúvidas separados para revisar depois.',
+            ),
+            SizedBox(height: 12),
+            Text(
+              '• Nova organização: consulte primeiro os áudios para revisar, os não confirmados ou os confirmados.',
+            ),
+            SizedBox(height: 12),
+            Text(
+              '• Os estados podem ser alterados a qualquer momento durante a revisão.',
+            ),
+          ],
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Entendi'),
+          ),
+        ],
+      ),
+    );
+    await _database.markVersionNoticeAsSeen(_appVersion);
   }
 
   Future<void> _migrateRecordings() async {
@@ -1092,13 +1149,18 @@ class _SessionPageState extends State<SessionPage> {
   bool _exporting = false;
   double _exportProgress = 0;
   String _exportMessage = '';
-  SessionSortMode _sortMode = SessionSortMode.name;
+  SessionSortMode _sortMode = SessionSortMode.consultFirst;
 
   List<AudioItem> get _visibleItems {
     final items = [...widget.session.items];
     switch (_sortMode) {
-      case SessionSortMode.name:
-        items.sort(compareAudioNames);
+      case SessionSortMode.consultFirst:
+        items.sort((first, second) {
+          final status = (second.incomplete ? 1 : 0).compareTo(
+            first.incomplete ? 1 : 0,
+          );
+          return status == 0 ? compareAudioNames(first, second) : status;
+        });
       case SessionSortMode.confirmed:
         items.sort((first, second) {
           final status = (second.confirmed ? 1 : 0).compareTo(
@@ -1291,8 +1353,8 @@ class _SessionPageState extends State<SessionPage> {
           onSelected: (mode) => setState(() => _sortMode = mode),
           itemBuilder: (context) => const [
             PopupMenuItem(
-              value: SessionSortMode.name,
-              child: Text('Ordenar por nome'),
+              value: SessionSortMode.consultFirst,
+              child: Text('Consultar primeiro'),
             ),
             PopupMenuItem(
               value: SessionSortMode.confirmed,
@@ -1383,10 +1445,14 @@ class _SessionPageState extends State<SessionPage> {
                             Align(
                               alignment: Alignment.topRight,
                               child: Icon(
-                                item.confirmed
+                                item.incomplete
+                                    ? Icons.help_outline_rounded
+                                    : item.confirmed
                                     ? Icons.check_circle_rounded
                                     : Icons.cancel_rounded,
-                                color: item.confirmed
+                                color: item.incomplete
+                                    ? Colors.orangeAccent
+                                    : item.confirmed
                                     ? Colors.greenAccent
                                     : Colors.redAccent,
                                 size: 22,
@@ -1466,6 +1532,9 @@ class _AudioPageState extends State<AudioPage> {
   InputDevice? _selectedDevice;
   bool _recording = false;
   bool _countdownEnabled = true;
+  bool _extraTimeEnabled = false;
+  int _extraRecordingSeconds = 1;
+  late final TextEditingController _extraTimeController;
   int _countdown = 0;
   double _countdownProgress = 0;
   Timer? _timer;
@@ -1479,6 +1548,9 @@ class _AudioPageState extends State<AudioPage> {
   @override
   void initState() {
     super.initState();
+    _extraTimeController = TextEditingController(
+      text: _extraRecordingSeconds.toString(),
+    );
     _extractWaveform();
     _loadDevices();
   }
@@ -1489,6 +1561,7 @@ class _AudioPageState extends State<AudioPage> {
     _recordingAttempt++;
     _progressTimer?.cancel();
     _amplitudeSubscription?.cancel();
+    _extraTimeController.dispose();
     _player.dispose();
     _recorder.dispose();
     super.dispose();
@@ -1655,7 +1728,13 @@ class _AudioPageState extends State<AudioPage> {
 
   Future<void> _startRecording() async {
     try {
-      final targetDurationMs = max(1, widget.item.durationMs);
+      final extraSeconds = _extraTimeEnabled
+          ? _extraRecordingSeconds.clamp(0, 3)
+          : 0;
+      final targetDurationMs = max(
+        1,
+        widget.item.durationMs + extraSeconds * 1000,
+      );
       const recordingMarginMs = 750;
       final path = await _persistentRecordingPath(widget.item.id);
       final previousRecording = File(path);
@@ -1802,6 +1881,7 @@ class _AudioPageState extends State<AudioPage> {
     savedItem.durationMs = widget.item.durationMs;
     savedItem.recordingPath = widget.item.recordingPath;
     savedItem.confirmed = widget.item.confirmed;
+    savedItem.incomplete = widget.item.incomplete;
     await widget.database.updateSession(session);
     return session;
   }
@@ -1825,10 +1905,37 @@ class _AudioPageState extends State<AudioPage> {
       ),
     );
     if (accepted != true || !mounted) return;
-    setState(() => widget.item.confirmed = true);
+    setState(() {
+      widget.item.confirmed = true;
+      widget.item.incomplete = false;
+    });
     await _sessionContainingItem();
     widget.onChanged();
     _message('Áudio ignorado e marcado como confirmado.');
+  }
+
+  Future<void> _markIncomplete() async {
+    setState(() {
+      widget.item.incomplete = true;
+      widget.item.confirmed = false;
+    });
+    await _sessionContainingItem();
+    widget.onChanged();
+    _message('Áudio marcado para consultar depois.');
+  }
+
+  Future<void> _toggleConfirmation() async {
+    setState(() {
+      widget.item.confirmed = !widget.item.confirmed;
+      widget.item.incomplete = false;
+    });
+    await widget.database.save(await _sessionContainingItem());
+    widget.onChanged();
+    _message(
+      widget.item.confirmed
+          ? 'Áudio confirmado.'
+          : 'Confirmação removida. O áudio pode ser revisado novamente.',
+    );
   }
 
   void _message(String text) {
@@ -1887,7 +1994,62 @@ class _AudioPageState extends State<AudioPage> {
                 : (device) => setState(() => _selectedDevice = device),
           ),
         if (_devices.isNotEmpty) const SizedBox(height: 12),
-        Row(
+        SwitchListTile.adaptive(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Tempo Extra'),
+          subtitle: Text(
+            _extraTimeEnabled
+                ? 'Adicione até 3 segundos à gravação'
+                : 'Grave pelo tempo exato do áudio original',
+          ),
+          value: _extraTimeEnabled,
+          onChanged: _recording || _countdown > 0
+              ? null
+              : (enabled) => setState(() => _extraTimeEnabled = enabled),
+        ),
+        if (_extraTimeEnabled) ...[
+          const SizedBox(height: 4),
+          TextField(
+            controller: _extraTimeController,
+            enabled: !_recording && _countdown == 0,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'Segundos extras',
+              helperText: 'Escolha um valor entre 0 e 3 segundos',
+              suffixText: 's',
+            ),
+            onChanged: (value) {
+              final parsed = int.tryParse(value);
+              if (parsed != null) {
+                final clamped = parsed.clamp(0, 3);
+                if (clamped != parsed) {
+                  _extraTimeController.value = TextEditingValue(
+                    text: clamped.toString(),
+                    selection: TextSelection.collapsed(
+                      offset: clamped.toString().length,
+                    ),
+                  );
+                }
+                setState(() => _extraRecordingSeconds = clamped);
+              }
+            },
+            onEditingComplete: () {
+              final value = _extraRecordingSeconds.clamp(0, 3);
+              _extraTimeController
+                ..text = value.toString()
+                ..selection = TextSelection.collapsed(
+                  offset: value.toString().length,
+                );
+              FocusScope.of(context).unfocus();
+            },
+          ),
+          const SizedBox(height: 12),
+        ],
+        Wrap(
+          alignment: WrapAlignment.start,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          runSpacing: 8,
           children: [
             IconButton.filled(
               onPressed: () =>
@@ -1921,13 +2083,19 @@ class _AudioPageState extends State<AudioPage> {
               ),
               color: _countdownEnabled ? null : Colors.orangeAccent,
             ),
-            const SizedBox(width: 8),
             OutlinedButton.icon(
               onPressed: _recording || _countdown > 0 || widget.item.confirmed
                   ? null
                   : _ignoreAudio,
               icon: const Icon(Icons.skip_next_rounded),
               label: const Text('Ignorar'),
+            ),
+            OutlinedButton.icon(
+              onPressed: _recording || _countdown > 0 ? null : _markIncomplete,
+              icon: const Icon(Icons.help_outline_rounded),
+              label: Text(
+                widget.item.incomplete ? 'Consultar' : 'Marcar para consultar',
+              ),
             ),
           ],
         ),
@@ -1957,13 +2125,15 @@ class _AudioPageState extends State<AudioPage> {
                 icon: const Icon(Icons.play_arrow_rounded),
               ),
               OutlinedButton.icon(
-                onPressed: () async {
-                  setState(() => widget.item.confirmed = true);
-                  await widget.database.save(await _sessionContainingItem());
-                  widget.onChanged();
-                },
-                icon: const Icon(Icons.check_rounded),
-                label: Text(widget.item.confirmed ? 'Confirmada' : 'Confirmar'),
+                onPressed: _toggleConfirmation,
+                icon: Icon(
+                  widget.item.confirmed
+                      ? Icons.remove_done_rounded
+                      : Icons.check_rounded,
+                ),
+                label: Text(
+                  widget.item.confirmed ? 'Desmarcar confirmação' : 'Confirmar',
+                ),
               ),
             ],
           ),
