@@ -18,6 +18,7 @@ import 'package:record/record.dart';
 import 'package:sembast/sembast_io.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'audio_merge_logic.dart';
 import 'github_release_service.dart';
 
 void main() => runApp(const KaitoDubsApp());
@@ -48,6 +49,8 @@ class AudioItem {
     required this.name,
     required this.sourcePath,
     required this.extension,
+    this.twoCharacters = false,
+    this.recordingPart,
     this.durationMs = 0,
     this.recordingPath,
     this.recordingOffsetMs = 0,
@@ -58,6 +61,8 @@ class AudioItem {
   final String name;
   final String sourcePath;
   final String extension;
+  bool twoCharacters;
+  DubPart? recordingPart;
   int durationMs;
   String? recordingPath;
   int recordingOffsetMs;
@@ -73,10 +78,16 @@ class DubSession {
 }
 
 class DubFolder {
-  DubFolder({required this.id, required this.name, required this.sessions});
+  DubFolder({
+    required this.id,
+    required this.name,
+    required this.sessions,
+    this.twoCharactersEnabled = false,
+  });
   final String id;
   final String name;
   final List<DubSession> sessions;
+  final bool twoCharactersEnabled;
 }
 
 String formatDuration(int milliseconds) {
@@ -114,6 +125,28 @@ String _archiveFileName(String name) {
   return sanitized.isEmpty ? 'arquivo' : sanitized;
 }
 
+String _dubbedFileName(AudioItem item) {
+  final partSuffix =
+      item.twoCharacters &&
+          item.recordingPath != null &&
+          item.recordingPart != null
+      ? '_${item.recordingPart!.suffix}'
+      : '';
+  return '${item.name}_dubbed$partSuffix.wav';
+}
+
+const _audioExtensions = {
+  '.mp3',
+  '.wav',
+  '.m4a',
+  '.aac',
+  '.ogg',
+  '.flac',
+  '.opus',
+  '.wma',
+};
+const _interPartGapMs = 200;
+
 Future<Directory> _recordingsDirectory() async {
   final root = await getApplicationSupportDirectory();
   final directory = Directory(p.join(root.path, 'recordings'));
@@ -134,7 +167,7 @@ Future<Uint8List> _encodeSessionArchive(DubSession session) async {
         : item.sourcePath;
     final data = await File(source).readAsBytes();
     final fileName = item.confirmed
-        ? '${item.name}_dubbed.wav'
+        ? _dubbedFileName(item)
         : '${item.name}${item.extension}';
     archive.addFile(ArchiveFile(fileName, data.length, data));
   }
@@ -176,6 +209,125 @@ Future<DubSession?> _sessionFromArchive({
   return DubSession(id: sessionId, name: sessionName, items: items);
 }
 
+class _MergeResult {
+  const _MergeResult({
+    required this.bytes,
+    required this.skippedGroups,
+    required this.duplicateParts,
+  });
+
+  final Uint8List bytes;
+  final int skippedGroups;
+  final int duplicateParts;
+}
+
+List<MergeAudioFile> _mergeAudioEntries(Archive archive) => archive.files
+    .where(
+      (entry) =>
+          entry.isFile &&
+          _audioExtensions.contains(p.extension(entry.name).toLowerCase()),
+    )
+    .map((entry) {
+      return MergeAudioFile.fromName(
+        name: entry.name,
+        bytes: Uint8List.fromList(entry.content as List<int>),
+      );
+    })
+    .toList();
+
+Future<Uint8List> _renderMergedAudio({
+  required MergeAudioFile first,
+  required MergeAudioFile second,
+  required bool overlap,
+  required Directory workDirectory,
+  required int index,
+}) async {
+  final firstPath = p.join(
+    workDirectory.path,
+    '$index-first${p.extension(first.name)}',
+  );
+  final secondPath = p.join(
+    workDirectory.path,
+    '$index-second${p.extension(second.name)}',
+  );
+  final outputPath = p.join(workDirectory.path, '$index-merged.wav');
+  await File(firstPath).writeAsBytes(first.bytes);
+  await File(secondPath).writeAsBytes(second.bytes);
+
+  final command = overlap
+      ? '-y -i "$firstPath" -i "$secondPath" '
+            '-filter_complex "[0:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=mono[a0];'
+            '[1:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=mono[a1];'
+            '[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=1[out]" '
+            '-map "[out]" -c:a pcm_s16le -ar 44100 -ac 1 "$outputPath"'
+      : '-y -i "$firstPath" '
+            '-f lavfi -t ${_interPartGapMs / 1000} -i "anullsrc=channel_layout=mono:sample_rate=44100" '
+            '-i "$secondPath" '
+            '-filter_complex "[0:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=mono[p1];'
+            '[2:a]silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB,'
+            'asetpts=PTS-STARTPTS,aresample=44100,'
+            'aformat=sample_fmts=s16:channel_layouts=mono[p2];'
+            '[p1][1:a][p2]concat=n=3:v=0:a=1[out]" '
+            '-map "[out]" -c:a pcm_s16le -ar 44100 -ac 1 "$outputPath"';
+  final session = await FFmpegKit.execute(command);
+  final code = await session.getReturnCode();
+  if (code == null ||
+      !ReturnCode.isSuccess(code) ||
+      !await File(outputPath).exists()) {
+    throw StateError(
+      'FFmpeg não conseguiu mesclar ${first.outputName} ($code).',
+    );
+  }
+  return File(outputPath).readAsBytes();
+}
+
+Future<_MergeResult> _mergeAudioArchives({
+  required Archive baseArchive,
+  required Archive additionsArchive,
+  required Directory workDirectory,
+  void Function(double progress)? onProgress,
+}) async {
+  final baseEntries = _mergeAudioEntries(baseArchive);
+  final additionsEntries = _mergeAudioEntries(additionsArchive);
+  final plan = buildMergeAudioPlan(baseEntries, additionsEntries);
+  final outputArchive = Archive();
+  final mergeActionCount = plan.actions
+      .where((action) => action.type != MergeActionType.keepBase)
+      .length;
+  var completedMergeActions = 0;
+  for (final action in plan.actions) {
+    if (action.type == MergeActionType.keepBase) {
+      outputArchive.addFile(
+        ArchiveFile(
+          action.outputName,
+          action.first.bytes.length,
+          action.first.bytes,
+        ),
+      );
+      continue;
+    }
+    final second = action.second;
+    if (second == null) {
+      throw StateError('A segunda parte de ${action.outputName} não existe.');
+    }
+    completedMergeActions++;
+    final bytes = await _renderMergedAudio(
+      first: action.first,
+      second: second,
+      overlap: action.type == MergeActionType.overlap,
+      workDirectory: workDirectory,
+      index: completedMergeActions,
+    );
+    outputArchive.addFile(ArchiveFile(action.outputName, bytes.length, bytes));
+    onProgress?.call(completedMergeActions / mergeActionCount);
+  }
+  return _MergeResult(
+    bytes: Uint8List.fromList(ZipEncoder().encode(outputArchive)),
+    skippedGroups: plan.skippedGroups,
+    duplicateParts: plan.duplicateParts,
+  );
+}
+
 final _store = stringMapStoreFactory.store('sessions');
 final _folderStore = stringMapStoreFactory.store('folders');
 final _settingsStore = stringMapStoreFactory.store('settings');
@@ -207,6 +359,8 @@ class DubDatabase {
         recordingOffsetMs: value['recordingOffsetMs'] as int? ?? 0,
         confirmed: value['confirmed'] as bool? ?? false,
         incomplete: value['incomplete'] as bool? ?? false,
+        twoCharacters: value['twoCharacters'] as bool? ?? false,
+        recordingPart: dubPartFromName(value['recordingPart'] as String?),
       );
     }).toList();
     return DubSession(id: id, name: data['name'] as String, items: items);
@@ -228,6 +382,7 @@ class DubDatabase {
         id: record.key,
         name: data['name'] as String,
         sessions: sessions,
+        twoCharactersEnabled: data['twoCharactersEnabled'] as bool? ?? false,
       );
     }).toList();
     if (result.isNotEmpty) return result;
@@ -263,6 +418,8 @@ class DubDatabase {
             'recordingOffsetMs': item.recordingOffsetMs,
             'confirmed': item.confirmed,
             'incomplete': item.incomplete,
+            'twoCharacters': item.twoCharacters,
+            'recordingPart': item.recordingPart?.name,
           },
         )
         .toList(),
@@ -271,6 +428,7 @@ class DubDatabase {
   Future<void> saveFolder(DubFolder folder) async {
     await _folderStore.record(folder.id).put(await database, {
       'name': folder.name,
+      'twoCharactersEnabled': folder.twoCharactersEnabled,
       'createdAt': DateTime.now().millisecondsSinceEpoch,
       'sessions': folder.sessions.map(_sessionData).toList(),
     });
@@ -623,9 +781,10 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  Future<String?> _askFolderName() async {
+  Future<({String name, bool twoCharacters})?> _askFolderDetails() async {
     final controller = TextEditingController();
-    return showDialog<String>(
+    var twoCharacters = false;
+    return showDialog<({String name, bool twoCharacters})>(
       context: context,
       barrierDismissible: false,
       builder: (context) => StatefulBuilder(
@@ -633,17 +792,34 @@ class _LibraryPageState extends State<LibraryPage> {
           final canCreate = controller.text.trim().isNotEmpty;
           return AlertDialog(
             title: const Text('Criar pasta'),
-            content: TextField(
-              controller: controller,
-              autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'Nome da pasta',
-                hintText: 'Ex.: Personagem 01',
-              ),
-              onChanged: (_) => setDialogState(() {}),
-              onSubmitted: canCreate
-                  ? (_) => Navigator.pop(context, controller.text.trim())
-                  : null,
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Nome da pasta',
+                    hintText: 'Ex.: Personagem 01',
+                  ),
+                  onChanged: (_) => setDialogState(() {}),
+                  onSubmitted: canCreate
+                      ? (_) => Navigator.pop(context, (
+                          name: controller.text.trim(),
+                          twoCharacters: twoCharacters,
+                        ))
+                      : null,
+                ),
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  controlAffinity: ListTileControlAffinity.leading,
+                  title: const Text('2 personagens em um?'),
+                  value: twoCharacters,
+                  onChanged: (value) =>
+                      setDialogState(() => twoCharacters = value ?? false),
+                ),
+              ],
             ),
             actions: [
               TextButton(
@@ -652,7 +828,10 @@ class _LibraryPageState extends State<LibraryPage> {
               ),
               FilledButton(
                 onPressed: canCreate
-                    ? () => Navigator.pop(context, controller.text.trim())
+                    ? () => Navigator.pop(context, (
+                        name: controller.text.trim(),
+                        twoCharacters: twoCharacters,
+                      ))
                     : null,
                 child: const Text('Criar pasta'),
               ),
@@ -664,20 +843,10 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   Future<void> _import() async {
-    const audioExtensions = {
-      '.mp3',
-      '.wav',
-      '.m4a',
-      '.aac',
-      '.ogg',
-      '.flac',
-      '.opus',
-      '.wma',
-    };
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: [
-        ...audioExtensions.map((extension) => extension.substring(1)),
+        ..._audioExtensions.map((e) => e.substring(1)),
         'zip',
         'rar',
       ],
@@ -685,8 +854,8 @@ class _LibraryPageState extends State<LibraryPage> {
       withData: true,
     );
     if (result == null || result.files.isEmpty) return;
-    final folderName = await _askFolderName();
-    if (folderName == null || folderName.isEmpty) return;
+    final folderOptions = await _askFolderDetails();
+    if (folderOptions == null || folderOptions.name.isEmpty) return;
     setState(() {
       _busy = true;
       _busyProgress = 0;
@@ -724,7 +893,7 @@ class _LibraryPageState extends State<LibraryPage> {
             folder: folder,
             sessionId: '$folderId-$fileIndex',
             sessionName: p.basenameWithoutExtension(selectedFile.name),
-            audioExtensions: audioExtensions,
+            audioExtensions: _audioExtensions,
           );
           if (directSession != null) sessions.add(directSession);
           for (
@@ -741,11 +910,11 @@ class _LibraryPageState extends State<LibraryPage> {
               folder: folder,
               sessionId: '$folderId-$fileIndex-$nestedIndex',
               sessionName: p.basenameWithoutExtension(nestedEntry.name),
-              audioExtensions: audioExtensions,
+              audioExtensions: _audioExtensions,
             );
             if (nestedSession != null) sessions.add(nestedSession);
           }
-        } else if (audioExtensions.contains(extension)) {
+        } else if (_audioExtensions.contains(extension)) {
           final bytes =
               selectedFile.bytes ??
               (selectedFile.path == null
@@ -788,7 +957,12 @@ class _LibraryPageState extends State<LibraryPage> {
         },
       );
       await _database.saveFolder(
-        DubFolder(id: folderId, name: folderName, sessions: sessions),
+        DubFolder(
+          id: folderId,
+          name: folderOptions.name,
+          sessions: sessions,
+          twoCharactersEnabled: folderOptions.twoCharacters,
+        ),
       );
       await _load();
     } catch (_) {
@@ -798,6 +972,114 @@ class _LibraryPageState extends State<LibraryPage> {
           _busy = false;
           _busyProgress = null;
         });
+    }
+  }
+
+  Future<({String name, Uint8List bytes})?> _pickMergeZip(
+    String dialogTitle,
+  ) async {
+    final result = await FilePicker.platform.pickFiles(
+      dialogTitle: dialogTitle,
+      type: FileType.custom,
+      allowedExtensions: ['zip'],
+      allowMultiple: false,
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return null;
+    final selected = result.files.single;
+    final bytes =
+        selected.bytes ??
+        (selected.path == null
+            ? null
+            : await File(selected.path!).readAsBytes());
+    if (bytes == null) {
+      throw FileSystemException('Não foi possível ler ${selected.name}.');
+    }
+    return (name: selected.name, bytes: bytes);
+  }
+
+  Future<void> _merge() async {
+    if (_busy) return;
+    try {
+      final base = await _pickMergeZip('Selecione o ZIP base');
+      if (base == null) return;
+      final additions = await _pickMergeZip('Selecione o ZIP de adições');
+      if (additions == null) return;
+
+      setState(() {
+        _busy = true;
+        _busyProgress = 0;
+        _busyMessage = 'Lendo os ZIPs...';
+      });
+      final baseArchive = ZipDecoder().decodeBytes(base.bytes);
+      final additionsArchive = ZipDecoder().decodeBytes(additions.bytes);
+      final temporaryRoot = await getTemporaryDirectory();
+      final workDirectory = Directory(
+        p.join(
+          temporaryRoot.path,
+          'merge-${DateTime.now().microsecondsSinceEpoch}',
+        ),
+      );
+      await workDirectory.create(recursive: true);
+      late final _MergeResult merged;
+      try {
+        merged = await _mergeAudioArchives(
+          baseArchive: baseArchive,
+          additionsArchive: additionsArchive,
+          workDirectory: workDirectory,
+          onProgress: (progress) {
+            if (mounted) {
+              setState(() {
+                _busyProgress = .1 + progress * .7;
+                _busyMessage = 'Mesclando os áudios...';
+              });
+            }
+          },
+        );
+      } finally {
+        if (await workDirectory.exists()) {
+          await workDirectory.delete(recursive: true);
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _busyProgress = .9;
+          _busyMessage = 'Salvando o ZIP mesclado...';
+        });
+      }
+      final output = await FilePicker.platform.saveFile(
+        dialogTitle: 'Escolha onde salvar o ZIP mesclado',
+        fileName: 'mesclado.zip',
+        type: FileType.custom,
+        allowedExtensions: ['zip'],
+        bytes: merged.bytes,
+      );
+      if (output != null) {
+        final warnings = <String>[];
+        if (merged.skippedGroups > 0) {
+          warnings.add('${merged.skippedGroups} grupo(s) sem par ignorado(s)');
+        }
+        if (merged.duplicateParts > 0) {
+          warnings.add(
+            '${merged.duplicateParts} parte(s) repetida(s) foram ignoradas; o ZIP base tem prioridade',
+          );
+        }
+        _message(
+          warnings.isEmpty
+              ? 'ZIP mesclado salvo em $output'
+              : 'ZIP salvo em $output. ${warnings.join('; ')}.',
+        );
+      }
+    } catch (error) {
+      if (mounted) _message('Não foi possível mesclar os ZIPs: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _busyProgress = null;
+        });
+      }
     }
   }
 
@@ -878,6 +1160,12 @@ class _LibraryPageState extends State<LibraryPage> {
               icon: const Icon(Icons.file_upload_outlined),
               label: const Text('Importar arquivos'),
             ),
+            const SizedBox(height: 8),
+            FilledButton.tonalIcon(
+              onPressed: _busy ? null : _merge,
+              icon: const Icon(Icons.merge_type),
+              label: const Text('Mesclar'),
+            ),
           ],
         ),
       );
@@ -895,6 +1183,15 @@ class _LibraryPageState extends State<LibraryPage> {
           ),
           const SizedBox(height: 24),
           _libraryTotalSummary(),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: FilledButton.tonalIcon(
+              onPressed: _busy ? null : _merge,
+              icon: const Icon(Icons.merge_type),
+              label: const Text('Mesclar'),
+            ),
+          ),
           const SizedBox(height: 10),
           ..._folders.map((folderData) {
             final sessions = folderData.sessions;
@@ -1114,6 +1411,7 @@ class _FolderPageState extends State<FolderPage> {
                     builder: (_) => SessionPage(
                       session: session,
                       database: widget.database,
+                      twoCharactersEnabled: widget.folder.twoCharactersEnabled,
                       onChanged: () {
                         widget.onChanged();
                         setState(() {});
@@ -1134,11 +1432,13 @@ class SessionPage extends StatefulWidget {
   const SessionPage({
     required this.session,
     required this.database,
+    required this.twoCharactersEnabled,
     required this.onChanged,
     super.key,
   });
   final DubSession session;
   final DubDatabase database;
+  final bool twoCharactersEnabled;
   final VoidCallback onChanged;
   @override
   State<SessionPage> createState() => _SessionPageState();
@@ -1252,7 +1552,7 @@ class _SessionPageState extends State<SessionPage> {
         final data = await File(alignedSource).readAsBytes();
         if (alignedSource != source) await File(alignedSource).delete();
         final fileName = item.confirmed
-            ? '${item.name}_dubbed.wav'
+            ? _dubbedFileName(item)
             : '${item.name}${item.extension}';
         archive.addFile(ArchiveFile(fileName, data.length, data));
         if (mounted)
@@ -1429,6 +1729,7 @@ class _SessionPageState extends State<SessionPage> {
                           builder: (_) => AudioPage(
                             item: item,
                             database: widget.database,
+                            canMarkTwoCharacters: widget.twoCharactersEnabled,
                             onChanged: () {
                               widget.onChanged();
                               setState(() {});
@@ -1511,11 +1812,13 @@ class AudioPage extends StatefulWidget {
   const AudioPage({
     required this.item,
     required this.database,
+    required this.canMarkTwoCharacters,
     required this.onChanged,
     super.key,
   });
   final AudioItem item;
   final DubDatabase database;
+  final bool canMarkTwoCharacters;
   final VoidCallback onChanged;
   @override
   State<AudioPage> createState() => _AudioPageState();
@@ -1544,10 +1847,12 @@ class _AudioPageState extends State<AudioPage> {
   bool _recordingBusy = false;
   bool _finishingRecording = false;
   int _recordingAttempt = 0;
+  late DubPart? _recordingPart;
 
   @override
   void initState() {
     super.initState();
+    _recordingPart = widget.item.recordingPart;
     _extraTimeController = TextEditingController(
       text: _extraRecordingSeconds.toString(),
     );
@@ -1882,8 +2187,31 @@ class _AudioPageState extends State<AudioPage> {
     savedItem.recordingPath = widget.item.recordingPath;
     savedItem.confirmed = widget.item.confirmed;
     savedItem.incomplete = widget.item.incomplete;
+    savedItem.twoCharacters = widget.item.twoCharacters;
+    savedItem.recordingPart = widget.item.recordingPart;
     await widget.database.updateSession(session);
     return session;
+  }
+
+  Future<void> _setRecordingPart(DubPart? part) async {
+    setState(() {
+      _recordingPart = part;
+      widget.item.recordingPart = part;
+    });
+    await _sessionContainingItem();
+    widget.onChanged();
+  }
+
+  Future<void> _setTwoCharacters(bool enabled) async {
+    setState(() {
+      widget.item.twoCharacters = enabled;
+      if (!enabled) {
+        _recordingPart = null;
+        widget.item.recordingPart = null;
+      }
+    });
+    await _sessionContainingItem();
+    widget.onChanged();
   }
 
   Future<void> _ignoreAudio() async {
@@ -1994,6 +2322,37 @@ class _AudioPageState extends State<AudioPage> {
                 : (device) => setState(() => _selectedDevice = device),
           ),
         if (_devices.isNotEmpty) const SizedBox(height: 12),
+        if (widget.canMarkTwoCharacters) ...[
+          CheckboxListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('2 personagens'),
+            subtitle: const Text('Este áudio tem falas de dois personagens'),
+            value: widget.item.twoCharacters,
+            onChanged: _recording || _countdown > 0
+                ? null
+                : (enabled) => _setTwoCharacters(enabled ?? false),
+          ),
+          if (widget.item.twoCharacters) ...[
+            DropdownButtonFormField<DubPart>(
+              initialValue: _recordingPart,
+              decoration: const InputDecoration(
+                labelText: 'Parte da dublagem',
+                helperText: 'Escolha uma opção antes de gravar',
+              ),
+              hint: const Text('Selecione uma parte'),
+              items: DubPart.values
+                  .map(
+                    (part) =>
+                        DropdownMenuItem(value: part, child: Text(part.label)),
+                  )
+                  .toList(),
+              onChanged: _recording || _countdown > 0
+                  ? null
+                  : _setRecordingPart,
+            ),
+          ],
+          const SizedBox(height: 12),
+        ],
         SwitchListTile.adaptive(
           contentPadding: EdgeInsets.zero,
           title: const Text('Tempo Extra'),
@@ -2063,6 +2422,8 @@ class _AudioPageState extends State<AudioPage> {
                   : _countdown > 0
                   ? null
                   : _recording
+                  ? null
+                  : widget.item.twoCharacters && _recordingPart == null
                   ? null
                   : _record,
               icon: Icon(Icons.timer_outlined),
